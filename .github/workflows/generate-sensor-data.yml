@@ -1,17 +1,64 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Sensor Data Generator
+# ============================================================
+# Runs generators/simulate_sensors.py on a schedule (or manually)
+# to generate HVAC telemetry (minute-level) and utility meter
+# (hourly-level) data, and uploads Parquet batches directly to a
+# Hugging Face Storage Bucket via the S3-compatible API (boto3,
+# handled inside the script itself).
+#
+# Required Repository Secrets:
+#   HF_ACCESS_KEY_ID     — Hugging Face S3 Access Key (from a User Access Token)
+#   HF_SECRET_ACCESS_KEY — Hugging Face S3 Secret Key
+#   HF_NAMESPACE         — Your HF username or org name
+#   HF_BUCKET_NAME       — Name of your Storage Bucket (must already exist)
+# ============================================================
+
 name: ThermoGrid Simulator to Hugging Face
 
 on:
-  # Allows manual triggering
-  workflow_dispatch: 
-  
-  # Runs automatically every hour
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Simulated minutes of HVAC telemetry to generate"
+        required: false
+        default: "5"
+        type: string
+      batch_size:
+        description: "Max rows per uploaded Parquet file"
+        required: false
+        default: "500"
+        type: string
+      tick_seconds:
+        description: "Seconds between generation ticks"
+        required: false
+        default: "30"
+        type: string
+      hours_back:
+        description: "Completed hours of utility meter data to backfill"
+        required: false
+        default: "6"
+        type: string
   schedule:
-    - cron: '0 * * * *'
+    - cron: "0 * * * *"   # every hour
 
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 30
+
+    env:
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    # This is the key fix: the script and requirements.txt live in
+    # generators/, so every step below runs from that folder.
+    defaults:
+      run:
+        working-directory: ./generators
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -19,26 +66,40 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          
+          python-version: "3.10"
+          cache: "pip"
+
       - name: Install Dependencies
-        # Added huggingface_hub to the installation list
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy huggingface_hub
+          pip install -r requirements.txt
+
+      - name: Validate secrets are set
+        run: |
+          if [ -z "$HF_ACCESS_KEY_ID" ] || [ -z "$HF_SECRET_ACCESS_KEY" ] || [ -z "$HF_NAMESPACE" ] || [ -z "$HF_BUCKET_NAME" ]; then
+            echo "::error::Missing required secrets. Please set HF_ACCESS_KEY_ID, HF_SECRET_ACCESS_KEY, HF_NAMESPACE, and HF_BUCKET_NAME in repository Settings → Secrets and variables → Actions."
+            exit 1
+          fi
 
       - name: Execute Simulator Script
+        id: generate
         run: |
-          python thermogrid_simulator.py
-          
-      - name: Upload to Hugging Face Dataset
-        env:
-          # Pulls your secure token from GitHub Secrets
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          python simulate_sensors.py \
+            --duration-minutes ${{ github.event.inputs.duration_minutes || '5' }} \
+            --batch-size ${{ github.event.inputs.batch_size || '500' }} \
+            --tick-seconds ${{ github.event.inputs.tick_seconds || '30' }} \
+            --hours-back ${{ github.event.inputs.hours_back || '6' }}
+
+      - name: Summary
+        if: always()
         run: |
-          # Authenticate with Hugging Face
-          huggingface-cli login --token $HF_TOKEN
-          
-          # Upload the generated CSVs to your Hugging Face dataset
-          # IMPORTANT: Replace 'YourUsername/ThermoGrid-Data' with your actual target repository
-          huggingface-cli upload YourUsername/ThermoGrid-Data . / --repo-type dataset --include "*.csv"
+          echo "## 📊 Sensor Data Generation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Readings   | ${{ steps.generate.outputs.total_readings || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| HVAC Readings    | ${{ steps.generate.outputs.hvac_readings || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Utility Readings | ${{ steps.generate.outputs.utility_readings || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Batches    | ${{ steps.generate.outputs.total_batches || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bucket           | ${{ env.HF_BUCKET_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by     | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
