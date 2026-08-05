@@ -1,0 +1,44 @@
+name: ThermoGrid Simulator to Hugging Face
+
+on:
+  # Allows manual triggering
+  workflow_dispatch: 
+  
+  # Runs automatically every hour
+  schedule:
+    - cron: '0 * * * *'
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          
+      - name: Install Dependencies
+        # Added huggingface_hub to the installation list
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy huggingface_hub
+
+      - name: Execute Simulator Script
+        run: |
+          python thermogrid_simulator.py
+          
+      - name: Upload to Hugging Face Dataset
+        env:
+          # Pulls your secure token from GitHub Secrets
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Authenticate with Hugging Face
+          huggingface-cli login --token $HF_TOKEN
+          
+          # Upload the generated CSVs to your Hugging Face dataset
+          # IMPORTANT: Replace 'YourUsername/ThermoGrid-Data' with your actual target repository
+          huggingface-cli upload YourUsername/ThermoGrid-Data . / --repo-type dataset --include "*.csv"
