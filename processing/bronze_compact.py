@@ -109,28 +109,30 @@ def read_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
 # ------------------------------------------------------------------
 # Delta write
 # ------------------------------------------------------------------
-def bronze_table_exists(table_uri: str, storage_options: dict) -> bool:
+def load_bronze_table(table_uri: str, storage_options: dict):
+    """Return an existing DeltaTable handle, or None if it doesn't exist yet."""
     try:
-        DeltaTable(table_uri, storage_options=storage_options)
-        return True
+        return DeltaTable(table_uri, storage_options=storage_options)
     except TableNotFoundError:
-        return False
+        return None
 
 
-def write_partition(table_uri: str, df: pd.DataFrame, building_id: str, dt: str,
-                     storage_options: dict, table_already_exists: bool) -> None:
-    if table_already_exists:
-        # atomically replace just this partition, leaving all others untouched
-        predicate = f"building_id = '{building_id}' AND dt = '{dt}'"
-        write_deltalake(
-            table_uri,
-            df,
-            mode="overwrite",
-            partition_by=["building_id", "dt"],
-            predicate=predicate,
-            storage_options=storage_options,
-        )
-    else:
+def write_partition(table_uri: str, dt_table, df: pd.DataFrame, building_id: str, dt: str,
+                     storage_options: dict):
+    """Write one partition's data.
+
+    Reuses a single live DeltaTable handle across the whole run rather than
+    reconstructing one from the URI string on every call. Re-deriving the
+    table's current version from a fresh URI each time means re-listing the
+    storage backend, and HF's S3-compatible storage doesn't guarantee the
+    same strict read-after-write listing consistency AWS S3 does - by the
+    third or fourth partition, the version the writer *thinks* it's on can
+    drift from what's actually there, causing "Invalid table version"
+    errors. Keeping the handle in-process avoids that.
+
+    Returns the (possibly newly created) DeltaTable handle.
+    """
+    if dt_table is None:
         # first write for this dataset - creates the table
         write_deltalake(
             table_uri,
@@ -139,6 +141,19 @@ def write_partition(table_uri: str, df: pd.DataFrame, building_id: str, dt: str,
             partition_by=["building_id", "dt"],
             storage_options=storage_options,
         )
+        return DeltaTable(table_uri, storage_options=storage_options)
+
+    # atomically replace just this partition, leaving all others untouched
+    predicate = f"building_id = '{building_id}' AND dt = '{dt}'"
+    write_deltalake(
+        dt_table,
+        df,
+        mode="overwrite",
+        predicate=predicate,
+        storage_options=storage_options,
+    )
+    dt_table.update_incremental()
+    return dt_table
 
 
 # ------------------------------------------------------------------
@@ -154,7 +169,7 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
 
     groups = group_by_partition(keys)
     table_uri = f"s3://{bucket}/bronze/{dataset_name}"
-    table_exists = bronze_table_exists(table_uri, storage_options)
+    dt_table = load_bronze_table(table_uri, storage_options)
 
     total_raw_rows = 0
     total_bronze_rows = 0
@@ -174,8 +189,7 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
         df["dt"] = dt
         bronze_rows = len(df)
 
-        write_partition(table_uri, df, building_id, dt, storage_options, table_exists)
-        table_exists = True  # table now exists after the first successful write
+        dt_table = write_partition(table_uri, dt_table, df, building_id, dt, storage_options)
 
         print(f"  building_id={building_id} dt={dt}: "
               f"{len(file_keys)} files, {raw_rows} raw rows -> {bronze_rows} bronze rows")
@@ -183,9 +197,8 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
         total_raw_rows += raw_rows
         total_bronze_rows += bronze_rows
 
-    if run_optimize and table_exists:
+    if run_optimize and dt_table is not None:
         print(f"  running OPTIMIZE + VACUUM on bronze/{dataset_name} ...")
-        dt_table = DeltaTable(table_uri, storage_options=storage_options)
         dt_table.optimize.compact()
         dt_table.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
 
