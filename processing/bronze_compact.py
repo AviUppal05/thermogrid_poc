@@ -165,6 +165,13 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
         raw_rows = len(df)
 
         df = df.drop_duplicates(subset=cfg["dedup_keys"]).reset_index(drop=True)
+
+        # 'dt' (and building_id, for safety) only exist in the S3 path, not
+        # inside the Parquet files themselves - Delta needs them as real
+        # columns to partition by, so stamp them on from what we parsed
+        # out of the path.
+        df["building_id"] = building_id
+        df["dt"] = dt
         bronze_rows = len(df)
 
         write_partition(table_uri, df, building_id, dt, storage_options, table_exists)
