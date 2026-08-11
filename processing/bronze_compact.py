@@ -178,10 +178,26 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
     write_bronze_table(table_uri, full_df, storage_options)
 
     if run_optimize:
-        print(f"  running OPTIMIZE + VACUUM on bronze/{dataset_name} ...")
-        dt_table = DeltaTable(table_uri, storage_options=storage_options)
-        dt_table.optimize.compact()
-        dt_table.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
+        try:
+            print(f"  running OPTIMIZE on bronze/{dataset_name} ...")
+            dt_table = DeltaTable(table_uri, storage_options=storage_options)
+            dt_table.optimize.compact()
+        except Exception as e:
+            # OPTIMIZE only merges/adds files - it never deletes, so a
+            # failure here is annoying but not risky, and shouldn't take
+            # down a run that already wrote the actual data successfully.
+            # This has been observed against HF's S3-compatible storage
+            # when the follow-up reload lands on a listing that hasn't
+            # caught up with the write that just happened.
+            print(f"  warning: OPTIMIZE failed, skipping (data write already "
+                  f"succeeded above): {e}")
+
+    # VACUUM deletes files, so it is deliberately NOT run automatically
+    # here. Running it with a stale view of the table (same storage-
+    # consistency lag as above) risks deleting a file that's still part
+    # of the live snapshot - a failed compaction is annoying, a bad
+    # vacuum is data loss. Run vacuum_bronze.py by hand occasionally
+    # instead, once things have settled.
 
     return {
         "partitions": len(groups),

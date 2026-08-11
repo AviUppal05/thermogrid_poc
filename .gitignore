@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local env files - never commit real credentials
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test/scratch output
+/tmp/
+*.log
+
+delete_prefix.py
