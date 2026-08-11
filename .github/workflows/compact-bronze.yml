@@ -1,0 +1,86 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Bronze Compaction
+# ============================================================
+# Reads all the small raw Parquet files landed by the generator and
+# consolidates each building_id/dt partition into a Delta table under
+# bronze/<dataset>, using the deltalake (delta-rs) package — no Spark
+# or Databricks cluster required.
+#
+# Required Repository Secrets (same ones as the generator):
+#   HF_ACCESS_KEY_ID
+#   HF_SECRET_ACCESS_KEY
+#   HF_NAMESPACE
+#   HF_BUCKET_NAME
+# ============================================================
+
+name: Compact Bronze
+
+on:
+  workflow_dispatch:
+    inputs:
+      optimize:
+        description: "Run Delta OPTIMIZE + VACUUM after writing"
+        required: false
+        default: "true"
+        type: boolean
+  schedule:
+    - cron: "15 */6 * * *"   # offset from the hourly generator so raw data has landed first
+
+jobs:
+  compact-bronze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate secrets are set
+        run: |
+          if [ -z "$HF_ACCESS_KEY_ID" ] || [ -z "$HF_SECRET_ACCESS_KEY" ] || [ -z "$HF_NAMESPACE" ] || [ -z "$HF_BUCKET_NAME" ]; then
+            echo "::error::Missing required secrets. Please set HF_ACCESS_KEY_ID, HF_SECRET_ACCESS_KEY, HF_NAMESPACE, and HF_BUCKET_NAME in repository Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Run Bronze compaction
+        id: compact
+        run: |
+          if [ "${{ github.event.inputs.optimize || 'true' }}" = "true" ]; then
+            python bronze_compact.py --optimize
+          else
+            python bronze_compact.py
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🥉 Bronze Compaction Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Partitions Processed | ${{ steps.compact.outputs.total_partitions || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Raw Source Files     | ${{ steps.compact.outputs.total_source_files || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Raw Rows Read        | ${{ steps.compact.outputs.total_raw_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze Rows Written  | ${{ steps.compact.outputs.total_bronze_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by         | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
