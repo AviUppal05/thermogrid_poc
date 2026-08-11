@@ -21,12 +21,14 @@ import io
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 
 import boto3
 import pandas as pd
 from botocore.client import Config
 from deltalake import DeltaTable, write_deltalake
+from deltalake.exceptions import DeltaError
 
 # ------------------------------------------------------------------
 # Dataset config: source prefix + natural key used to drop duplicate
@@ -108,30 +110,42 @@ def read_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
 # ------------------------------------------------------------------
 # Delta write
 # ------------------------------------------------------------------
-def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict) -> None:
-    """Write the full dataset in a single Delta commit.
+def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
+                        max_attempts: int = 4) -> None:
+    """Write the full dataset in a single Delta commit, with retries.
 
     Earlier versions of this script wrote one commit per partition,
     reusing a live DeltaTable handle across the loop. That still failed
     against HF's S3-compatible storage with "Invalid table version"
     errors - each commit requires correctly reading the table's current
     version from the storage backend, and that backend doesn't guarantee
-    the same strict read-after-write consistency AWS S3 does. After a
-    couple of commits in the same run, the version the writer thinks
-    it's on can drift from what's actually there.
-
-    Since this script already re-reads *all* raw data on every run (no
-    incremental/watermark tracking yet), there's no benefit to multiple
-    partial commits anyway - a single full-table overwrite in one
-    atomic commit sidesteps the whole problem.
+    the same strict read-after-write consistency AWS S3 does. Switching
+    to a single full-table overwrite per run removed most of the
+    problem, but the same underlying lag can still occasionally cause
+    a single write to fail if it lands right after another operation
+    (e.g. a prior run's OPTIMIZE) touched the log. A short retry with
+    backoff, forcing a fresh read of the table state each attempt,
+    resolves these transient cases without needing manual intervention.
     """
-    write_deltalake(
-        table_uri,
-        df,
-        mode="overwrite",
-        partition_by=["building_id", "dt"],
-        storage_options=storage_options,
-    )
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            write_deltalake(
+                table_uri,
+                df,
+                mode="overwrite",
+                partition_by=["building_id", "dt"],
+                storage_options=storage_options,
+            )
+            return
+        except DeltaError as e:
+            last_error = e
+            if attempt < max_attempts:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                print(f"  write attempt {attempt}/{max_attempts} failed "
+                      f"({e}), retrying in {wait}s...")
+                time.sleep(wait)
+    raise last_error
 
 
 # ------------------------------------------------------------------
