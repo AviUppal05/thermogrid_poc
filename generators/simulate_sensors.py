@@ -55,8 +55,41 @@ FAULT_CODES = ["HC-412", "CC-118", "FAN-207", "DP-305", "SENS-004"]
 FAULT_PROBABILITY = 0.015      # per equipment per tick
 WARNING_PROBABILITY = 0.03     # per equipment per tick
 
+# Sensor GLITCH is intentionally separate from equipment FAULTS above.
+# A fault_code means the equipment is genuinely malfunctioning - that's
+# real operational signal and should read as physically plausible data
+# (a stalled fan really does report near-zero speed). A glitch means the
+# SENSOR OR TRANSMISSION corrupted the reading itself - a stuck ADC, a
+# bit-flip, a dropped/garbled packet - producing a value that shouldn't
+# be trusted regardless of what the equipment is actually doing. This is
+# what Silver's data_quality_flag is designed to catch, independent of
+# fault_code/status_flag.
+SENSOR_GLITCH_PROBABILITY = 0.04   # per equipment per tick
+
 # in-memory equipment state so readings drift smoothly instead of jumping
 _equipment_state: dict[str, dict] = {}
+
+
+def apply_hvac_glitch(row: dict) -> dict:
+    """With low probability, corrupt one field into a physically
+    implausible value - simulating a bad sensor/transmission rather than
+    a genuine equipment fault. fault_code/status_flag are left untouched."""
+    if random.random() >= SENSOR_GLITCH_PROBABILITY:
+        return row
+
+    glitch_type = random.choice([
+        "extreme_temp", "negative_pressure", "fan_out_of_range", "missing_equipment_id",
+    ])
+    if glitch_type == "extreme_temp":
+        field = random.choice(["supply_air_temp", "return_air_temp", "outdoor_air_temp"])
+        row[field] = round(random.choice([random.uniform(-200, -50), random.uniform(300, 500)]), 1)
+    elif glitch_type == "negative_pressure":
+        row["duct_pressure"] = round(-abs(random.uniform(1, 20)), 2)
+    elif glitch_type == "fan_out_of_range":
+        row["fan_speed_pct"] = round(random.choice([random.uniform(-50, -1), random.uniform(150, 300)]), 1)
+    elif glitch_type == "missing_equipment_id":
+        row["equipment_id"] = None
+    return row
 
 
 # ------------------------------------------------------------------
@@ -154,7 +187,7 @@ def generate_hvac_reading(ts: datetime, building_id: str, equipment_id: str) -> 
         if random.random() < 0.3:
             status_flag = "Offline"
 
-    return {
+    return apply_hvac_glitch({
         "timestamp": ts.strftime("%Y-%m-%d %H:%M:00"),
         "equipment_id": equipment_id,
         "building_id": building_id,
@@ -168,7 +201,7 @@ def generate_hvac_reading(ts: datetime, building_id: str, equipment_id: str) -> 
         "outdoor_air_temp": oat,
         "fault_code": fault_code,
         "status_flag": status_flag,
-    }
+    })
 
 
 def tou_rate(hour: int, utility_type: str) -> float:
@@ -184,6 +217,22 @@ def tou_rate(hour: int, utility_type: str) -> float:
     else:
         base = 0.11
     return round(base + random.uniform(-0.01, 0.01), 3)
+
+
+def apply_utility_glitch(row: dict) -> dict:
+    """Same idea as apply_hvac_glitch - simulates a bad meter reading or
+    transmission error, independent of the actual consumption pattern."""
+    if random.random() >= SENSOR_GLITCH_PROBABILITY:
+        return row
+
+    glitch_type = random.choice(["negative_consumption", "zero_cost_rate", "negative_peak_demand"])
+    if glitch_type == "negative_consumption":
+        row["actual_consumption_kwh"] = round(-abs(random.uniform(10, 200)), 1)
+    elif glitch_type == "zero_cost_rate":
+        row["cost_rate"] = 0.0
+    elif glitch_type == "negative_peak_demand":
+        row["peak_demand_kw"] = round(-abs(random.uniform(10, 200)), 1)
+    return row
 
 
 def generate_utility_reading(ts: datetime, building_id: str, meter_id: str, utility_type: str) -> dict:
@@ -205,7 +254,7 @@ def generate_utility_reading(ts: datetime, building_id: str, meter_id: str, util
     actual_consumption_kwh = round(expected_consumption_kwh * variance_multiplier, 1)
     peak_demand_kw = round(actual_consumption_kwh * random.uniform(1.05, 1.35), 1)
 
-    return {
+    return apply_utility_glitch({
         "timestamp": ts.strftime("%Y-%m-%d %H:00:00"),
         "meter_id": meter_id,
         "building_id": building_id,
@@ -214,7 +263,7 @@ def generate_utility_reading(ts: datetime, building_id: str, meter_id: str, util
         "expected_consumption_kwh": expected_consumption_kwh,
         "peak_demand_kw": peak_demand_kw,
         "cost_rate": tou_rate(hour, utility_type),
-    }
+    })
 
 
 # ------------------------------------------------------------------
@@ -230,6 +279,29 @@ def get_s3_client():
         region_name="us-east-1",
         config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
     )
+
+
+def ensure_bucket_exists(namespace: str, bucket: str) -> None:
+    """Create the Storage Bucket if it doesn't exist yet.
+
+    Buckets are their own repo type on the Hub — referencing a name in
+    HF_BUCKET_NAME does not create it. This uses the regular Hub API
+    (HF_TOKEN), which is separate from the S3 access key/secret used
+    for the actual uploads. If HF_TOKEN isn't set, this is skipped and
+    you must create the bucket manually (web UI or `hf bucket create`)
+    before running the script.
+    """
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("  (HF_TOKEN not set - skipping auto-create; "
+              "make sure the bucket already exists)")
+        return
+    try:
+        from huggingface_hub import create_bucket
+        create_bucket(f"{namespace}/{bucket}", token=token, exist_ok=True)
+        print(f"  confirmed bucket exists: {namespace}/{bucket}")
+    except Exception as e:
+        print(f"  warning: could not verify/create bucket via Hub API: {e}")
 
 
 def upload_batch(s3, bucket: str, dataset: str, building_id: str, dt: str, rows: list[dict]) -> str:
@@ -283,7 +355,9 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
+    namespace = os.environ["HF_NAMESPACE"]
     bucket = os.environ["HF_BUCKET_NAME"]
+    ensure_bucket_exists(namespace, bucket)
     s3 = get_s3_client()
 
     # ---------------- HVAC telemetry (minute-level) ----------------
