@@ -27,7 +27,6 @@ import boto3
 import pandas as pd
 from botocore.client import Config
 from deltalake import DeltaTable, write_deltalake
-from deltalake.exceptions import TableNotFoundError
 
 # ------------------------------------------------------------------
 # Dataset config: source prefix + natural key used to drop duplicate
@@ -109,51 +108,30 @@ def read_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
 # ------------------------------------------------------------------
 # Delta write
 # ------------------------------------------------------------------
-def load_bronze_table(table_uri: str, storage_options: dict):
-    """Return an existing DeltaTable handle, or None if it doesn't exist yet."""
-    try:
-        return DeltaTable(table_uri, storage_options=storage_options)
-    except TableNotFoundError:
-        return None
+def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict) -> None:
+    """Write the full dataset in a single Delta commit.
 
+    Earlier versions of this script wrote one commit per partition,
+    reusing a live DeltaTable handle across the loop. That still failed
+    against HF's S3-compatible storage with "Invalid table version"
+    errors - each commit requires correctly reading the table's current
+    version from the storage backend, and that backend doesn't guarantee
+    the same strict read-after-write consistency AWS S3 does. After a
+    couple of commits in the same run, the version the writer thinks
+    it's on can drift from what's actually there.
 
-def write_partition(table_uri: str, dt_table, df: pd.DataFrame, building_id: str, dt: str,
-                     storage_options: dict):
-    """Write one partition's data.
-
-    Reuses a single live DeltaTable handle across the whole run rather than
-    reconstructing one from the URI string on every call. Re-deriving the
-    table's current version from a fresh URI each time means re-listing the
-    storage backend, and HF's S3-compatible storage doesn't guarantee the
-    same strict read-after-write listing consistency AWS S3 does - by the
-    third or fourth partition, the version the writer *thinks* it's on can
-    drift from what's actually there, causing "Invalid table version"
-    errors. Keeping the handle in-process avoids that.
-
-    Returns the (possibly newly created) DeltaTable handle.
+    Since this script already re-reads *all* raw data on every run (no
+    incremental/watermark tracking yet), there's no benefit to multiple
+    partial commits anyway - a single full-table overwrite in one
+    atomic commit sidesteps the whole problem.
     """
-    if dt_table is None:
-        # first write for this dataset - creates the table
-        write_deltalake(
-            table_uri,
-            df,
-            mode="overwrite",
-            partition_by=["building_id", "dt"],
-            storage_options=storage_options,
-        )
-        return DeltaTable(table_uri, storage_options=storage_options)
-
-    # atomically replace just this partition, leaving all others untouched
-    predicate = f"building_id = '{building_id}' AND dt = '{dt}'"
     write_deltalake(
-        dt_table,
+        table_uri,
         df,
         mode="overwrite",
-        predicate=predicate,
+        partition_by=["building_id", "dt"],
         storage_options=storage_options,
     )
-    dt_table.update_incremental()
-    return dt_table
 
 
 # ------------------------------------------------------------------
@@ -169,10 +147,9 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
 
     groups = group_by_partition(keys)
     table_uri = f"s3://{bucket}/bronze/{dataset_name}"
-    dt_table = load_bronze_table(table_uri, storage_options)
 
     total_raw_rows = 0
-    total_bronze_rows = 0
+    partition_dfs = []
 
     for (building_id, dt), file_keys in sorted(groups.items()):
         dfs = [read_parquet_from_s3(s3, bucket, k) for k in file_keys]
@@ -187,18 +164,22 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
         # out of the path.
         df["building_id"] = building_id
         df["dt"] = dt
-        bronze_rows = len(df)
-
-        dt_table = write_partition(table_uri, dt_table, df, building_id, dt, storage_options)
 
         print(f"  building_id={building_id} dt={dt}: "
-              f"{len(file_keys)} files, {raw_rows} raw rows -> {bronze_rows} bronze rows")
+              f"{len(file_keys)} files, {raw_rows} raw rows -> {len(df)} deduped rows")
 
         total_raw_rows += raw_rows
-        total_bronze_rows += bronze_rows
+        partition_dfs.append(df)
 
-    if run_optimize and dt_table is not None:
+    full_df = pd.concat(partition_dfs, ignore_index=True)
+    total_bronze_rows = len(full_df)
+
+    print(f"  writing {total_bronze_rows} rows across {len(groups)} partitions in a single commit...")
+    write_bronze_table(table_uri, full_df, storage_options)
+
+    if run_optimize:
         print(f"  running OPTIMIZE + VACUUM on bronze/{dataset_name} ...")
+        dt_table = DeltaTable(table_uri, storage_options=storage_options)
         dt_table.optimize.compact()
         dt_table.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
 
