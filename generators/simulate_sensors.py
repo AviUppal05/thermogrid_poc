@@ -64,10 +64,44 @@ WARNING_PROBABILITY = 0.03     # per equipment per tick
 # be trusted regardless of what the equipment is actually doing. This is
 # what Silver's data_quality_flag is designed to catch, independent of
 # fault_code/status_flag.
-SENSOR_GLITCH_PROBABILITY = 0.04   # per equipment per tick
+SENSOR_GLITCH_PROBABILITY = 0.04   # per equipment per tick - hard/impossible values -> critical
+
+# SOFT_ANOMALY is different again from both faults and hard glitches: it
+# nudges values into an implausible RELATIONSHIP while every individual
+# field stays inside its normal physical range (e.g. supply air a couple
+# degrees above return air - odd, but each number on its own looks fine).
+# This is what actually exercises the warning tier - hard glitches always
+# also break a critical check, so a row with one never surfaces as
+# "warning" (critical takes priority once any critical check fails).
+SOFT_ANOMALY_PROBABILITY = 0.04   # per equipment per tick - plausible-but-odd -> warning
 
 # in-memory equipment state so readings drift smoothly instead of jumping
 _equipment_state: dict[str, dict] = {}
+
+
+def apply_hvac_soft_anomaly(row: dict) -> dict:
+    """Nudges supply_air_temp a few degrees above return_air_temp while
+    keeping both within their normal, physically valid ranges - odd
+    enough to warrant a warning, not implausible enough to be critical."""
+    if random.random() >= SOFT_ANOMALY_PROBABILITY:
+        return row
+    return_temp = row["return_air_temp"]
+    row["supply_air_temp"] = round(min(return_temp + random.uniform(1, 6), 99.0), 1)
+    return row
+
+
+def apply_utility_soft_anomaly(row: dict) -> dict:
+    """Two independent plausible-but-odd relationships: peak demand
+    dipping just under the hour's average consumption, or a missing
+    baseline (expected_consumption_kwh = 0). Both fields stay positive
+    and in-range individually."""
+    if random.random() >= SOFT_ANOMALY_PROBABILITY:
+        return row
+    if random.random() < 0.5:
+        row["peak_demand_kw"] = round(row["actual_consumption_kwh"] * random.uniform(0.7, 0.95), 1)
+    else:
+        row["expected_consumption_kwh"] = 0.0
+    return row
 
 
 def apply_hvac_glitch(row: dict) -> dict:
@@ -75,7 +109,7 @@ def apply_hvac_glitch(row: dict) -> dict:
     implausible value - simulating a bad sensor/transmission rather than
     a genuine equipment fault. fault_code/status_flag are left untouched."""
     if random.random() >= SENSOR_GLITCH_PROBABILITY:
-        return row
+        return apply_hvac_soft_anomaly(row)
 
     glitch_type = random.choice([
         "extreme_temp", "negative_pressure", "fan_out_of_range", "missing_equipment_id",
@@ -223,7 +257,7 @@ def apply_utility_glitch(row: dict) -> dict:
     """Same idea as apply_hvac_glitch - simulates a bad meter reading or
     transmission error, independent of the actual consumption pattern."""
     if random.random() >= SENSOR_GLITCH_PROBABILITY:
-        return row
+        return apply_utility_soft_anomaly(row)
 
     glitch_type = random.choice(["negative_consumption", "zero_cost_rate", "negative_peak_demand"])
     if glitch_type == "negative_consumption":
