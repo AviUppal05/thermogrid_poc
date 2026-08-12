@@ -110,9 +110,29 @@ def read_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
 # ------------------------------------------------------------------
 # Delta write
 # ------------------------------------------------------------------
-def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
-                        max_attempts: int = 4) -> None:
-    """Write the full dataset in a single Delta commit, with retries.
+def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
+    """Deletes every object under a prefix. Used for self-healing a
+    corrupted Bronze table - see write_bronze_table for why."""
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    deleted = 0
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        resp = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+        )
+        deleted += len(batch) - len(resp.get("Errors", []))
+    return deleted
+
+
+def write_bronze_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
+                        storage_options: dict, max_attempts: int = 4) -> None:
+    """Write the full dataset in a single Delta commit, with retries, and
+    a self-healing fallback if retries are exhausted.
 
     Earlier versions of this script wrote one commit per partition,
     reusing a live DeltaTable handle across the loop. That still failed
@@ -121,12 +141,19 @@ def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
     version from the storage backend, and that backend doesn't guarantee
     the same strict read-after-write consistency AWS S3 does. Switching
     to a single full-table overwrite per run removed most of the
-    problem, but the same underlying lag can still occasionally cause
-    a single write to fail if it lands right after another operation
-    (e.g. a prior run's OPTIMIZE) touched the log. A short retry with
-    backoff, forcing a fresh read of the table state each attempt,
-    resolves these transient cases without needing manual intervention.
+    problem, but the same error can still recur - observed in practice
+    consistently blaming "version 1" regardless of how many commits the
+    table is actually on, which points to a stale/corrupted checkpoint
+    in the Delta log rather than a one-off timing race. Retries alone
+    don't fix that; the log itself needs to go.
+
+    Since this script already re-reads and rewrites *all* raw data every
+    run (no incremental state), there is nothing to lose by wiping the
+    Bronze table and recreating it from scratch if it's ever unhealthy -
+    this makes that recovery automatic instead of requiring a manual
+    "please delete bronze/" step each time it happens.
     """
+    table_uri = f"s3://{bucket}/bronze/{dataset_name}"
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -145,7 +172,19 @@ def write_bronze_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
                 print(f"  write attempt {attempt}/{max_attempts} failed "
                       f"({e}), retrying in {wait}s...")
                 time.sleep(wait)
-    raise last_error
+
+    print(f"  all {max_attempts} write attempts failed ({last_error}). "
+          f"Self-healing: wiping bronze/{dataset_name} and recreating fresh...")
+    deleted = delete_prefix_objects(s3, bucket, f"bronze/{dataset_name}/")
+    print(f"  deleted {deleted} object(s) under bronze/{dataset_name}/, retrying write once more...")
+    write_deltalake(
+        table_uri,
+        df,
+        mode="overwrite",
+        partition_by=["building_id", "dt"],
+        storage_options=storage_options,
+    )
+    print(f"  self-heal succeeded - bronze/{dataset_name} recreated cleanly.")
 
 
 # ------------------------------------------------------------------
@@ -189,7 +228,7 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
     total_bronze_rows = len(full_df)
 
     print(f"  writing {total_bronze_rows} rows across {len(groups)} partitions in a single commit...")
-    write_bronze_table(table_uri, full_df, storage_options)
+    write_bronze_table(s3, bucket, dataset_name, full_df, storage_options)
 
     if run_optimize:
         try:
