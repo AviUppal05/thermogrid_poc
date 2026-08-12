@@ -37,7 +37,9 @@ import os
 import sys
 import time
 
+import boto3
 import pandas as pd
+from botocore.client import Config
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import DeltaError, TableNotFoundError
 
@@ -45,6 +47,18 @@ from deltalake.exceptions import DeltaError, TableNotFoundError
 # ------------------------------------------------------------------
 # Storage helpers
 # ------------------------------------------------------------------
+def get_s3_client():
+    namespace = os.environ["HF_NAMESPACE"]
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://s3.hf.co/{namespace}",
+        aws_access_key_id=os.environ["HF_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["HF_SECRET_ACCESS_KEY"],
+        region_name="us-east-1",
+        config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
+    )
+
+
 def deltalake_storage_options():
     return {
         "endpoint_url": f"https://s3.hf.co/{os.environ['HF_NAMESPACE']}",
@@ -55,13 +69,34 @@ def deltalake_storage_options():
     }
 
 
-def write_silver_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
-                        max_attempts: int = 4) -> None:
-    """Same retry-with-backoff pattern used for Bronze - see bronze_compact.py
-    for the full reasoning. HF's S3-compatible storage doesn't guarantee
-    strict read-after-write consistency, so an occasional transient
-    version mismatch is expected and worth retrying rather than failing
-    the whole run over."""
+def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
+    """Deletes every object under a prefix. Used for self-healing a
+    corrupted Silver table - see write_silver_table for why."""
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    deleted = 0
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        resp = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+        )
+        deleted += len(batch) - len(resp.get("Errors", []))
+    return deleted
+
+
+def write_silver_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
+                        storage_options: dict, max_attempts: int = 4) -> None:
+    """Retry-with-backoff, then self-heal by wiping and recreating the
+    table if retries are exhausted - same pattern and reasoning as
+    bronze_compact.py's write_bronze_table. Since Silver is rebuilt
+    fully from Bronze on every run (no incremental state), there's
+    nothing lost by wiping a Silver table that's gotten into a bad
+    state and recreating it fresh in the same run."""
+    table_uri = f"s3://{bucket}/silver/{dataset_name}"
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -80,7 +115,19 @@ def write_silver_table(table_uri: str, df: pd.DataFrame, storage_options: dict,
                 print(f"  write attempt {attempt}/{max_attempts} failed "
                       f"({e}), retrying in {wait}s...")
                 time.sleep(wait)
-    raise last_error
+
+    print(f"  all {max_attempts} write attempts failed ({last_error}). "
+          f"Self-healing: wiping silver/{dataset_name} and recreating fresh...")
+    deleted = delete_prefix_objects(s3, bucket, f"silver/{dataset_name}/")
+    print(f"  deleted {deleted} object(s) under silver/{dataset_name}/, retrying write once more...")
+    write_deltalake(
+        table_uri,
+        df,
+        mode="overwrite",
+        partition_by=["building_id", "dt"],
+        storage_options=storage_options,
+    )
+    print(f"  self-heal succeeded - silver/{dataset_name} recreated cleanly.")
 
 
 # ------------------------------------------------------------------
@@ -185,10 +232,9 @@ def utility_quality_checks(df: pd.DataFrame) -> list[tuple]:
 # ------------------------------------------------------------------
 # Main per-dataset routine
 # ------------------------------------------------------------------
-def build_silver(dataset_name: str, bucket: str, storage_options: dict) -> dict:
+def build_silver(s3, dataset_name: str, bucket: str, storage_options: dict) -> dict:
     print(f"\n=== {dataset_name} ===")
     bronze_uri = f"s3://{bucket}/bronze/{dataset_name}"
-    silver_uri = f"s3://{bucket}/silver/{dataset_name}"
 
     try:
         bronze_table = DeltaTable(bronze_uri, storage_options=storage_options)
@@ -214,7 +260,7 @@ def build_silver(dataset_name: str, bucket: str, storage_options: dict) -> dict:
           f"(all {total_rows} rows kept)")
 
     print(f"  writing {total_rows} rows to Silver in a single commit...")
-    write_silver_table(silver_uri, df, storage_options)
+    write_silver_table(s3, bucket, dataset_name, df, storage_options)
 
     return {"rows": total_rows, "clean": clean, "warning": warning, "critical": critical}
 
@@ -227,10 +273,11 @@ def main():
 
     bucket = os.environ["HF_BUCKET_NAME"]
     storage_options = deltalake_storage_options()
+    s3 = get_s3_client()
 
     results = {}
     for name in args.datasets:
-        results[name] = build_silver(name, bucket, storage_options)
+        results[name] = build_silver(s3, name, bucket, storage_options)
 
     print("\n=== Summary ===")
     total_rows = total_clean = total_warning = total_critical = 0
