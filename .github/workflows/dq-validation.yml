@@ -1,38 +1,29 @@
 # ============================================================
-# GitHub Actions: ThermoGrid Silver Build
+# GitHub Actions: ThermoGrid DQ Validation
 # ============================================================
-# Reads the Bronze Delta tables, type-casts, and adds non-destructive
-# data quality flags, writing the result to silver/<dataset>.
+# Stage 6: range checks, duplicate validation, quarantine table for
+# critical rows, and a persisted DQ log. Reads staging/, writes
+# dq_validated/, quarantine/, dq_logs/.
 #
-# Triggered automatically after "Compact Bronze" finishes successfully
-# (rather than a fixed cron offset), so Silver always runs against
-# fresh Bronze data without needing to guess how long Bronze takes.
-#
-# Required Repository Secrets (same as the other jobs):
-#   HF_ACCESS_KEY_ID
-#   HF_SECRET_ACCESS_KEY
-#   HF_NAMESPACE
-#   HF_BUCKET_NAME
+# Triggered automatically after "Build Staging" finishes successfully.
 # ============================================================
 
-name: Build Silver
+name: DQ Validation
 
 on:
   workflow_dispatch:
   workflow_run:
-    workflows: ["Compact Bronze"]
+    workflows: ["Build Staging"]
     types: [completed]
 
 concurrency:
-  group: build-silver
+  group: dq-validation
   cancel-in-progress: false
 
 jobs:
-  build-silver:
+  dq-validation:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Only run if triggered manually, or if Bronze actually succeeded -
-    # no point building Silver from a Bronze run that failed.
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
@@ -48,11 +39,9 @@ jobs:
         working-directory: ./processing
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
@@ -69,19 +58,20 @@ jobs:
             exit 1
           fi
 
-      - name: Build Silver
-        id: silver
-        run: python silver_build.py
+      - name: Run DQ Validation
+        id: dq
+        run: python dq_validation.py
 
       - name: Summary
         if: always()
         run: |
-          echo "## 🥈 Silver Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔍 DQ Validation Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Total Rows | ${{ steps.silver.outputs.total_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Clean      | ${{ steps.silver.outputs.total_clean || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Warning    | ${{ steps.silver.outputs.total_warning || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical   | ${{ steps.silver.outputs.total_critical || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Rows | ${{ steps.dq.outputs.total_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Clean      | ${{ steps.dq.outputs.total_clean || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Warning    | ${{ steps.dq.outputs.total_warning || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (quarantined copy) | ${{ steps.dq.outputs.total_critical || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duplicates Found (should be 0) | ${{ steps.dq.outputs.total_duplicates_found || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY

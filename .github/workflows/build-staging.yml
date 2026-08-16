@@ -1,0 +1,83 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Staging Build
+# ============================================================
+# Stage 5: type casting, null handling, deduplication, and formatting.
+# Reads Bronze, writes staging/<dataset>.
+#
+# Triggered automatically after "Compact Bronze" (the ingestion
+# pipeline) finishes successfully.
+#
+# Required Repository Secrets (same as the other jobs):
+#   HF_ACCESS_KEY_ID
+#   HF_SECRET_ACCESS_KEY
+#   HF_NAMESPACE
+#   HF_BUCKET_NAME
+# ============================================================
+
+name: Build Staging
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Compact Bronze"]
+    types: [completed]
+
+concurrency:
+  group: build-staging
+  cancel-in-progress: false
+
+jobs:
+  build-staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate secrets are set
+        run: |
+          if [ -z "$HF_ACCESS_KEY_ID" ] || [ -z "$HF_SECRET_ACCESS_KEY" ] || [ -z "$HF_NAMESPACE" ] || [ -z "$HF_BUCKET_NAME" ]; then
+            echo "::error::Missing required secrets."
+            exit 1
+          fi
+
+      - name: Build Staging
+        id: staging
+        run: python staging_build.py
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🧹 Staging Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rows In  | ${{ steps.staging.outputs.total_rows_in || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rows Out | ${{ steps.staging.outputs.total_rows_out || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duplicates Removed | ${{ steps.staging.outputs.total_duplicates_removed || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY

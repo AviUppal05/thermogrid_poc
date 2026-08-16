@@ -1,0 +1,76 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Fault Detection
+# ============================================================
+# Stage 7: derived anomaly detection (overheating, coolant leak),
+# re-surfaced alongside the generator's own fault signal. Reads
+# dq_validated/hvac_telemetry, writes fault_detection/hvac_telemetry.
+#
+# Triggered automatically after "DQ Validation" finishes successfully.
+# ============================================================
+
+name: Fault Detection
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["DQ Validation"]
+    types: [completed]
+
+concurrency:
+  group: fault-detection
+  cancel-in-progress: false
+
+jobs:
+  fault-detection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate secrets are set
+        run: |
+          if [ -z "$HF_ACCESS_KEY_ID" ] || [ -z "$HF_SECRET_ACCESS_KEY" ] || [ -z "$HF_NAMESPACE" ] || [ -z "$HF_BUCKET_NAME" ]; then
+            echo "::error::Missing required secrets."
+            exit 1
+          fi
+
+      - name: Run Fault Detection
+        id: fault
+        run: python fault_detection.py
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🚨 Fault Detection Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Rows | ${{ steps.fault.outputs.total_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Overheating | ${{ steps.fault.outputs.overheating_count || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Coolant Leak | ${{ steps.fault.outputs.coolant_leak_count || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Operational Fault | ${{ steps.fault.outputs.operational_fault_count || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY

@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 """
-ThermoGrid — Raw to Bronze Compaction
-=======================================
-Reads every small raw Parquet file under raw/<dataset>/building_id=*/dt=*/
-in the Hugging Face Storage Bucket, consolidates each partition into a
-single deduplicated batch, and writes it as a proper Delta table under
-bronze/<dataset> using the deltalake (delta-rs) package.
+ThermoGrid — Raw Data Ingestion Pipeline (Bronze)
+=====================================================
+Stages 3-4 of the project roadmap: Bronze layer creation + raw data
+ingestion pipeline with incremental load logic and watermark tracking.
 
-No Spark, no Databricks — this runs entirely on a GitHub Actions runner.
+This is a pure LANDING layer. It does:
+    - schema drift detection (missing/extra columns vs. expected)
+    - audit/lineage metadata (_source_file, _ingested_at, _pipeline_run_id)
+    - incremental append of only NEW raw files since the last run,
+      tracked via a watermark manifest stored alongside the table
+    - file compaction (OPTIMIZE) as part of the ingestion pipeline
 
-Env vars required (same ones used by the generator):
+It deliberately does NOT do:
+    - deduplication (moved to Staging - Bronze preserves exactly what
+      arrived, duplicates and all)
+    - any business-rule validation, range checks, or type coercion
+
+Watermark tracking: a small JSON manifest at
+bronze/_manifests/<dataset>_ingested_files.json records every raw file
+key already ingested. Each run only reads and appends files NOT in
+that manifest, instead of reprocessing the entire raw/ history every
+time.
+
+No Spark, no Databricks - runs entirely on a GitHub Actions runner.
+
+Env vars required:
     HF_ACCESS_KEY_ID
     HF_SECRET_ACCESS_KEY
     HF_NAMESPACE
@@ -18,30 +34,43 @@ Env vars required (same ones used by the generator):
 
 import argparse
 import io
+import json
 import os
 import re
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import boto3
 import pandas as pd
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from deltalake import DeltaTable, write_deltalake
-from deltalake.exceptions import DeltaError
+from deltalake.exceptions import DeltaError, TableNotFoundError
 
 # ------------------------------------------------------------------
-# Dataset config: source prefix + natural key used to drop duplicate
-# rows (raw files are never deleted, so re-running must be idempotent)
+# Dataset config: source prefix and the expected schema used for
+# basic validation / schema-drift handling on the way into Bronze.
+# (dedup_keys live in staging_build.py now, not here.)
 # ------------------------------------------------------------------
 DATASETS = {
     "hvac_telemetry": {
         "raw_prefix": "raw/hvac_telemetry/",
-        "dedup_keys": ["timestamp", "equipment_id"],
+        "expected_columns": [
+            "timestamp", "equipment_id", "building_id", "supply_air_temp",
+            "return_air_temp", "fan_speed_pct", "duct_pressure", "filter_pressure_drop",
+            "cooling_coil_temp", "heating_coil_temp", "outdoor_air_temp",
+            "fault_code", "status_flag",
+        ],
     },
     "utility_meter": {
         "raw_prefix": "raw/utility_meter/",
-        "dedup_keys": ["timestamp", "meter_id"],
+        "expected_columns": [
+            "timestamp", "meter_id", "building_id", "utility_type",
+            "actual_consumption_kwh", "expected_consumption_kwh",
+            "peak_demand_kw", "cost_rate",
+        ],
     },
 }
 
@@ -64,13 +93,10 @@ def get_s3_client():
 
 
 def deltalake_storage_options():
-    """storage_options for the deltalake (delta-rs) writer.
-
-    AWS_S3_ALLOW_UNSAFE_RENAME is required because delta-rs normally uses
-    a DynamoDB locking provider to guarantee safe concurrent writes on S3.
-    The HF bucket doesn't support that, but our GitHub Actions jobs run
-    one writer at a time, so unsafe rename is safe in this setup.
-    """
+    """AWS_S3_ALLOW_UNSAFE_RENAME is required because delta-rs normally
+    uses a DynamoDB locking provider to guarantee safe concurrent writes
+    on S3. The HF bucket doesn't support that, but our GitHub Actions
+    jobs run one writer at a time, so unsafe rename is safe here."""
     return {
         "endpoint_url": f"https://s3.hf.co/{os.environ['HF_NAMESPACE']}",
         "AWS_ACCESS_KEY_ID": os.environ["HF_ACCESS_KEY_ID"],
@@ -108,11 +134,109 @@ def read_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------
+# Watermark manifest - tracks which raw files have already been
+# ingested, so each run only processes what's new.
+# ------------------------------------------------------------------
+def manifest_key(dataset_name: str) -> str:
+    return f"bronze/_manifests/{dataset_name}_ingested_files.json"
+
+
+def get_manifest(s3, bucket: str, dataset_name: str) -> set[str]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=manifest_key(dataset_name))
+        data = json.loads(obj["Body"].read())
+        return set(data.get("ingested_files", []))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return set()  # no manifest yet - first run
+        raise
+
+
+def put_manifest(s3, bucket: str, dataset_name: str, ingested_files: set[str]) -> None:
+    body = json.dumps({
+        "ingested_files": sorted(ingested_files),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=manifest_key(dataset_name), Body=body,
+                  ContentType="application/json")
+
+
+# ------------------------------------------------------------------
+# Schema validation + audit metadata
+# ------------------------------------------------------------------
+def validate_schema(df: pd.DataFrame, expected_columns: list[str], source_key: str) -> pd.DataFrame:
+    """Basic schema validation / schema-drift handling: check the file
+    has the columns it's supposed to, without judging the VALUES.
+
+    - Expected column missing -> filled with null, logged (visible
+      drift, not silent data loss).
+    - Unexpected extra column present -> kept, logged (schema
+      evolution - Bronze preserves what arrived, doesn't decide it
+      doesn't belong).
+    """
+    missing = [c for c in expected_columns if c not in df.columns]
+    extra = [c for c in df.columns if c not in expected_columns]
+
+    if missing:
+        print(f"    schema drift in {source_key}: missing columns {missing} - filling with null")
+        for col in missing:
+            df[col] = pd.NA
+    if extra:
+        print(f"    schema drift in {source_key}: unexpected columns {extra} - keeping them")
+
+    return df
+
+
+def tag_audit_metadata(df: pd.DataFrame, source_key: str, ingested_at: str, run_id: str) -> pd.DataFrame:
+    """Audit/lineage metadata - doesn't touch the actual data, just
+    records where and when it came from."""
+    df["_source_file"] = source_key
+    df["_ingested_at"] = ingested_at
+    df["_pipeline_run_id"] = run_id
+    return df
+
+
+def process_files_into_df(s3, bucket: str, file_keys: list[str], cfg: dict,
+                           ingested_at: str, run_id: str):
+    """Reads a set of raw files, applies schema validation + audit
+    tagging, and stamps building_id/dt from the path. Deliberately no
+    dedup here - that's Staging's job now."""
+    groups = group_by_partition(file_keys)
+    total_raw_rows = 0
+    partition_dfs = []
+
+    for (building_id, dt), keys in sorted(groups.items()):
+        dfs = []
+        for k in keys:
+            file_df = read_parquet_from_s3(s3, bucket, k)
+            file_df = validate_schema(file_df, cfg["expected_columns"], k)
+            file_df = tag_audit_metadata(file_df, k, ingested_at, run_id)
+            dfs.append(file_df)
+        df = pd.concat(dfs, ignore_index=True)
+        raw_rows = len(df)
+
+        # 'dt' (and building_id, for safety) only exist in the S3 path,
+        # not inside the Parquet files - Delta needs them as real
+        # columns to partition by.
+        df["building_id"] = building_id
+        df["dt"] = dt
+
+        print(f"  building_id={building_id} dt={dt}: {len(keys)} file(s), {raw_rows} row(s)")
+
+        total_raw_rows += raw_rows
+        partition_dfs.append(df)
+
+    full_df = pd.concat(partition_dfs, ignore_index=True) if partition_dfs else pd.DataFrame()
+    return full_df, total_raw_rows, groups
+
+
+# ------------------------------------------------------------------
 # Delta write
 # ------------------------------------------------------------------
 def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
     """Deletes every object under a prefix. Used for self-healing a
-    corrupted Bronze table - see write_bronze_table for why."""
+    corrupted Bronze table."""
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -129,38 +253,29 @@ def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
     return deleted
 
 
-def write_bronze_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
-                        storage_options: dict, max_attempts: int = 4) -> None:
-    """Write the full dataset in a single Delta commit, with retries, and
-    a self-healing fallback if retries are exhausted.
+def bronze_table_exists(table_uri: str, storage_options: dict) -> bool:
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except TableNotFoundError:
+        return False
 
-    Earlier versions of this script wrote one commit per partition,
-    reusing a live DeltaTable handle across the loop. That still failed
-    against HF's S3-compatible storage with "Invalid table version"
-    errors - each commit requires correctly reading the table's current
-    version from the storage backend, and that backend doesn't guarantee
-    the same strict read-after-write consistency AWS S3 does. Switching
-    to a single full-table overwrite per run removed most of the
-    problem, but the same error can still recur - observed in practice
-    consistently blaming "version 1" regardless of how many commits the
-    table is actually on, which points to a stale/corrupted checkpoint
-    in the Delta log rather than a one-off timing race. Retries alone
-    don't fix that; the log itself needs to go.
 
-    Since this script already re-reads and rewrites *all* raw data every
-    run (no incremental state), there is nothing to lose by wiping the
-    Bronze table and recreating it from scratch if it's ever unhealthy -
-    this makes that recovery automatic instead of requiring a manual
-    "please delete bronze/" step each time it happens.
-    """
-    table_uri = f"s3://{bucket}/bronze/{dataset_name}"
+def write_bronze_delta(table_uri: str, df: pd.DataFrame, storage_options: dict,
+                        mode: str, max_attempts: int = 4) -> None:
+    """Write with retry-and-backoff. mode is 'overwrite' (table doesn't
+    exist yet, or a self-heal rebuild) or 'append' (normal incremental
+    case). See compact_dataset for the self-heal fallback if all
+    retries here are exhausted - it needs to fully reprocess raw
+    files, which this function doesn't have access to, so that lives
+    one level up."""
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             write_deltalake(
                 table_uri,
                 df,
-                mode="overwrite",
+                mode=mode,
                 partition_by=["building_id", "dt"],
                 storage_options=storage_options,
             )
@@ -172,63 +287,67 @@ def write_bronze_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
                 print(f"  write attempt {attempt}/{max_attempts} failed "
                       f"({e}), retrying in {wait}s...")
                 time.sleep(wait)
-
-    print(f"  all {max_attempts} write attempts failed ({last_error}). "
-          f"Self-healing: wiping bronze/{dataset_name} and recreating fresh...")
-    deleted = delete_prefix_objects(s3, bucket, f"bronze/{dataset_name}/")
-    print(f"  deleted {deleted} object(s) under bronze/{dataset_name}/, retrying write once more...")
-    write_deltalake(
-        table_uri,
-        df,
-        mode="overwrite",
-        partition_by=["building_id", "dt"],
-        storage_options=storage_options,
-    )
-    print(f"  self-heal succeeded - bronze/{dataset_name} recreated cleanly.")
+    raise last_error
 
 
 # ------------------------------------------------------------------
-# Main compaction routine
+# Main ingestion routine
 # ------------------------------------------------------------------
 def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
-                     storage_options: dict, run_optimize: bool) -> dict:
+                     storage_options: dict, run_optimize: bool,
+                     ingested_at: str, run_id: str) -> dict:
     print(f"\n=== {dataset_name} ===")
-    keys = list_raw_files(s3, bucket, cfg["raw_prefix"])
-    if not keys:
+    all_keys = list_raw_files(s3, bucket, cfg["raw_prefix"])
+    if not all_keys:
         print("  no raw files found, skipping")
-        return {"partitions": 0, "raw_rows": 0, "bronze_rows": 0, "source_files": 0}
+        return {"new_files": 0, "raw_rows": 0, "bronze_rows": 0, "source_files": 0}
 
-    groups = group_by_partition(keys)
     table_uri = f"s3://{bucket}/bronze/{dataset_name}"
+    manifest = get_manifest(s3, bucket, dataset_name)
+    new_keys = sorted(k for k in all_keys if k not in manifest)
 
-    total_raw_rows = 0
-    partition_dfs = []
+    if not new_keys:
+        print(f"  watermark: {len(manifest)} file(s) already ingested, "
+              f"0 new file(s) since last run - nothing to do")
+        return {"new_files": 0, "raw_rows": 0, "bronze_rows": 0, "source_files": len(all_keys)}
 
-    for (building_id, dt), file_keys in sorted(groups.items()):
-        dfs = [read_parquet_from_s3(s3, bucket, k) for k in file_keys]
-        df = pd.concat(dfs, ignore_index=True)
-        raw_rows = len(df)
+    print(f"  watermark: {len(manifest)} file(s) already ingested, "
+          f"{len(new_keys)} new file(s) to process")
 
-        df = df.drop_duplicates(subset=cfg["dedup_keys"]).reset_index(drop=True)
-
-        # 'dt' (and building_id, for safety) only exist in the S3 path, not
-        # inside the Parquet files themselves - Delta needs them as real
-        # columns to partition by, so stamp them on from what we parsed
-        # out of the path.
-        df["building_id"] = building_id
-        df["dt"] = dt
-
-        print(f"  building_id={building_id} dt={dt}: "
-              f"{len(file_keys)} files, {raw_rows} raw rows -> {len(df)} deduped rows")
-
-        total_raw_rows += raw_rows
-        partition_dfs.append(df)
-
-    full_df = pd.concat(partition_dfs, ignore_index=True)
+    table_exists = bronze_table_exists(table_uri, storage_options)
+    full_df, total_raw_rows, groups = process_files_into_df(
+        s3, bucket, new_keys, cfg, ingested_at, run_id)
     total_bronze_rows = len(full_df)
 
-    print(f"  writing {total_bronze_rows} rows across {len(groups)} partitions in a single commit...")
-    write_bronze_table(s3, bucket, dataset_name, full_df, storage_options)
+    mode = "append" if table_exists else "overwrite"
+    print(f"  writing {total_bronze_rows} new row(s) across {len(groups)} "
+          f"partition(s) ({mode})...")
+
+    ingested_this_run = new_keys
+    try:
+        write_bronze_delta(table_uri, full_df, storage_options, mode)
+    except DeltaError as e:
+        # Retries exhausted. Rather than fail the whole run, wipe this
+        # dataset's Bronze table and rebuild it from ALL raw files
+        # (not just the new ones) - raw/ is never deleted, so nothing
+        # is actually lost, just re-read. See historical note: this
+        # error has recurred consistently blaming a specific stale
+        # version regardless of how many commits the table is on,
+        # pointing to a corrupted checkpoint rather than a one-off race.
+        print(f"  all retries failed ({e}). Self-healing: wiping "
+              f"bronze/{dataset_name} and reprocessing ALL {len(all_keys)} "
+              f"raw file(s) from scratch...")
+        delete_prefix_objects(s3, bucket, f"bronze/{dataset_name}/")
+        full_df, total_raw_rows, groups = process_files_into_df(
+            s3, bucket, all_keys, cfg, ingested_at, run_id)
+        total_bronze_rows = len(full_df)
+        write_bronze_delta(table_uri, full_df, storage_options, "overwrite")
+        ingested_this_run = all_keys
+        print(f"  self-heal succeeded - bronze/{dataset_name} recreated "
+              f"fresh from all raw data.")
+
+    manifest |= set(ingested_this_run)
+    put_manifest(s3, bucket, dataset_name, manifest)
 
     if run_optimize:
         try:
@@ -239,49 +358,47 @@ def compact_dataset(s3, bucket: str, dataset_name: str, cfg: dict,
             # OPTIMIZE only merges/adds files - it never deletes, so a
             # failure here is annoying but not risky, and shouldn't take
             # down a run that already wrote the actual data successfully.
-            # This has been observed against HF's S3-compatible storage
-            # when the follow-up reload lands on a listing that hasn't
-            # caught up with the write that just happened.
-            print(f"  warning: OPTIMIZE failed, skipping (data write already "
-                  f"succeeded above): {e}")
+            print(f"  warning: OPTIMIZE failed, skipping (data write "
+                  f"already succeeded above): {e}")
 
-    # VACUUM deletes files, so it is deliberately NOT run automatically
-    # here. Running it with a stale view of the table (same storage-
-    # consistency lag as above) risks deleting a file that's still part
-    # of the live snapshot - a failed compaction is annoying, a bad
-    # vacuum is data loss. Run vacuum_bronze.py by hand occasionally
-    # instead, once things have settled.
+    # VACUUM deletes files, so it is deliberately NOT run automatically -
+    # see vacuum_bronze.py for the manual, safe-retention alternative.
 
     return {
-        "partitions": len(groups),
+        "new_files": len(new_keys),
         "raw_rows": total_raw_rows,
         "bronze_rows": total_bronze_rows,
-        "source_files": len(keys),
+        "source_files": len(all_keys),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compact raw ThermoGrid data into Bronze Delta tables")
+    parser = argparse.ArgumentParser(description="Incrementally ingest raw ThermoGrid data into Bronze")
     parser.add_argument("--optimize", action="store_true",
-                         help="Run Delta OPTIMIZE (file compaction) + VACUUM after writing")
+                         help="Run Delta OPTIMIZE (file compaction) after writing")
     parser.add_argument("--datasets", nargs="+", choices=list(DATASETS.keys()), default=list(DATASETS.keys()),
-                         help="Which datasets to compact (default: all)")
+                         help="Which datasets to ingest (default: all)")
     args = parser.parse_args()
 
     bucket = os.environ["HF_BUCKET_NAME"]
     s3 = get_s3_client()
     storage_options = deltalake_storage_options()
 
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+
     results = {}
     for name in args.datasets:
-        results[name] = compact_dataset(s3, bucket, name, DATASETS[name], storage_options, args.optimize)
+        results[name] = compact_dataset(s3, bucket, name, DATASETS[name], storage_options,
+                                         args.optimize, ingested_at, run_id)
 
     print("\n=== Summary ===")
-    total_partitions = total_raw = total_bronze = total_files = 0
+    total_new_files = total_raw = total_bronze = total_files = 0
     for name, r in results.items():
-        print(f"{name}: {r['partitions']} partitions, {r['source_files']} source files, "
-              f"{r['raw_rows']} raw rows -> {r['bronze_rows']} bronze rows")
-        total_partitions += r["partitions"]
+        print(f"{name}: {r['new_files']} new file(s) ingested, "
+              f"{r['raw_rows']} raw row(s) -> {r['bronze_rows']} bronze row(s) "
+              f"({r['source_files']} total raw files seen)")
+        total_new_files += r["new_files"]
         total_raw += r["raw_rows"]
         total_bronze += r["bronze_rows"]
         total_files += r["source_files"]
@@ -289,7 +406,7 @@ def main():
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
-            f.write(f"total_partitions={total_partitions}\n")
+            f.write(f"total_new_files={total_new_files}\n")
             f.write(f"total_source_files={total_files}\n")
             f.write(f"total_raw_rows={total_raw}\n")
             f.write(f"total_bronze_rows={total_bronze}\n")
