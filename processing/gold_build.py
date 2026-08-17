@@ -160,7 +160,18 @@ def build_hvac_daily_summary(df: pd.DataFrame) -> pd.DataFrame:
 # Utility daily summary
 # ------------------------------------------------------------------
 def build_utility_daily_summary(df: pd.DataFrame) -> pd.DataFrame:
-    reliable = df[df["data_quality_flag"] != "critical"]
+    reliable = df[df["data_quality_flag"] != "critical"].copy()
+    # is_over_consuming arrives as object dtype (True/False/<NA> mix from
+    # Silver's .where()). Aggregating an object-dtype boolean column with
+    # .sum() is unreliable across group sizes: a multi-row group correctly
+    # sums to a real int, but a SINGLE-row group just returns that one
+    # object unchanged - a raw Python bool, not a computed sum. Mixing
+    # int and bool in the same output column then breaks the PyArrow
+    # write ("Expected integer, got bool"). Casting to a clean boolean
+    # dtype first makes .sum() behave consistently regardless of group
+    # size. Safe here since `reliable` has already excluded critical
+    # rows, which is the only source of nulls in this column.
+    reliable["is_over_consuming"] = reliable["is_over_consuming"].astype(bool)
 
     counts = df.groupby(["building_id", "dt", "utility_type"]).agg(
         total_readings=("meter_id", "count"),
