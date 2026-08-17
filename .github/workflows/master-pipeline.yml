@@ -1,0 +1,184 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Master Pipeline
+# ============================================================
+# Stage 10: runs the full Bronze -> Staging -> DQ -> Fault Detection
+# -> Silver -> Gold chain as sequential JOBS within ONE workflow run,
+# so the whole pipeline's status is visible on a single page instead
+# of clicking through 6 separate workflow runs.
+#
+# This is ADDITIVE, not a replacement: the individual chained
+# workflows (Compact Bronze, Build Staging, etc.) keep running on
+# their own schedules exactly as before. This workflow is a second,
+# complementary way to trigger and observe a full run on demand -
+# useful for demos, testing, and backfills.
+#
+# Every job calls the SAME scripts the individual workflows use - no
+# logic is duplicated or reimplemented here.
+#
+# Required Repository Secrets (same as every other workflow):
+#   HF_ACCESS_KEY_ID
+#   HF_SECRET_ACCESS_KEY
+#   HF_NAMESPACE
+#   HF_BUCKET_NAME
+# ============================================================
+
+name: Master Pipeline
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: master-pipeline
+  cancel-in-progress: false
+
+env:
+  HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+  HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+  HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+  HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+jobs:
+  bronze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      start_time: ${{ steps.start.outputs.start_time }}
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - id: start
+        run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python bronze_compact.py --optimize
+
+  staging:
+    needs: bronze
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python staging_build.py
+
+  dq:
+    needs: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python dq_validation.py
+
+  fault_detection:
+    needs: dq
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python fault_detection.py
+
+  silver:
+    needs: fault_detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python silver_business_transform.py
+
+  gold:
+    needs: silver
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: python gold_build.py
+
+  # always() so this runs and logs the outcome even if an earlier stage
+  # failed - a failed run is exactly what you want captured in the
+  # audit trail, not silently skipped.
+  log_execution:
+    needs: [bronze, staging, dq, fault_detection, silver, gold]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ./processing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+
+      - name: Log pipeline execution
+        run: |
+          DURATION=$(( $(date +%s) - ${{ needs.bronze.outputs.start_time }} ))
+          python log_pipeline_execution.py \
+            --run-id "${{ github.run_id }}" \
+            --triggered-by "${{ github.event_name }}" \
+            --duration-seconds "$DURATION" \
+            --bronze "${{ needs.bronze.result }}" \
+            --staging "${{ needs.staging.result }}" \
+            --dq "${{ needs.dq.result }}" \
+            --fault_detection "${{ needs.fault_detection.result }}" \
+            --silver "${{ needs.silver.result }}" \
+            --gold "${{ needs.gold.result }}"
+
+      - name: Summary
+        run: |
+          echo "## 🎛️ Master Pipeline Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze | ${{ needs.bronze.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Staging | ${{ needs.staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DQ Validation | ${{ needs.dq.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fault Detection | ${{ needs.fault_detection.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Silver | ${{ needs.silver.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gold | ${{ needs.gold.result }} |" >> $GITHUB_STEP_SUMMARY
