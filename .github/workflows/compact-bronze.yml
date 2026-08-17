@@ -26,12 +26,17 @@ on:
   schedule:
     - cron: "15 */6 * * *"   # offset from the hourly generator so raw data has landed first
 
+concurrency:
+  group: compact-bronze
+  cancel-in-progress: false   # let a running job finish rather than killing a mid-write commit
+
 jobs:
   compact-bronze:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
+      PYTHONUNBUFFERED: "1"
       HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
       HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
       HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}

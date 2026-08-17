@@ -30,6 +30,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
 
     env:
+      PYTHONUNBUFFERED: "1"
       HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
       HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
       HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}

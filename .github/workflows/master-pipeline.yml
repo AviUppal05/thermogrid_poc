@@ -36,6 +36,7 @@ env:
   HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
   HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
   HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+  PYTHONUNBUFFERED:     "1"
 
 jobs:
   bronze:

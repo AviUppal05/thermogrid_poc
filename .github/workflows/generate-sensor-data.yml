@@ -48,10 +48,12 @@ jobs:
     timeout-minutes: 30
 
     env:
+      PYTHONUNBUFFERED: "1"
       HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
       HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
       HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
       HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+      HF_TOKEN:             ${{ secrets.HF_TOKEN }}   # optional: lets the script auto-create the bucket
 
     # This is the key fix: the script and requirements.txt live in
     # generators/, so every step below runs from that folder.
