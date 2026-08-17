@@ -1,0 +1,76 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Gold Build
+# ============================================================
+# Stage 9: dashboard-ready aggregated KPI tables, operational
+# summaries, and alarm analytics. Reads silver/, writes
+# gold/hvac_daily_summary, gold/utility_daily_summary, gold/alarm_log.
+#
+# Triggered automatically after "Build Silver Business Transform"
+# finishes successfully - this is the end of the automated chain.
+# ============================================================
+
+name: Build Gold
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build Silver Business Transform"]
+    types: [completed]
+
+concurrency:
+  group: build-gold
+  cancel-in-progress: false
+
+jobs:
+  build-gold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate secrets are set
+        run: |
+          if [ -z "$HF_ACCESS_KEY_ID" ] || [ -z "$HF_SECRET_ACCESS_KEY" ] || [ -z "$HF_NAMESPACE" ] || [ -z "$HF_BUCKET_NAME" ]; then
+            echo "::error::Missing required secrets."
+            exit 1
+          fi
+
+      - name: Build Gold
+        id: gold
+        run: python gold_build.py
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🏆 Gold Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Table | Rows |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| hvac_daily_summary | ${{ steps.gold.outputs.hvac_summary_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| utility_daily_summary | ${{ steps.gold.outputs.utility_summary_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| alarm_log | ${{ steps.gold.outputs.alarm_log_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
