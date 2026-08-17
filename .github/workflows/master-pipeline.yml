@@ -47,9 +47,9 @@ jobs:
       run:
         working-directory: ./processing
     steps:
+      - uses: actions/checkout@v4
       - id: start
         run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -158,7 +158,13 @@ jobs:
 
       - name: Log pipeline execution
         run: |
-          DURATION=$(( $(date +%s) - ${{ needs.bronze.outputs.start_time }} ))
+          START_TIME="${{ needs.bronze.outputs.start_time }}"
+          if [ -z "$START_TIME" ]; then
+            echo "warning: bronze never recorded a start_time (it likely failed before reaching that step) - duration will be logged as 0"
+            DURATION=0
+          else
+            DURATION=$(( $(date +%s) - START_TIME ))
+          fi
           python log_pipeline_execution.py \
             --run-id "${{ github.run_id }}" \
             --triggered-by "${{ github.event_name }}" \
