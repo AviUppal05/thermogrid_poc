@@ -40,6 +40,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import boto3
@@ -48,6 +49,8 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import DeltaError, TableNotFoundError
+
+MAX_PARALLEL_FETCHES = 16
 
 # ------------------------------------------------------------------
 # Dataset config: source prefix and the expected schema used for
@@ -197,11 +200,54 @@ def tag_audit_metadata(df: pd.DataFrame, source_key: str, ingested_at: str, run_
     return df
 
 
+def fetch_files_parallel(s3, bucket: str, file_keys: list[str],
+                          max_workers: int = MAX_PARALLEL_FETCHES) -> dict[str, pd.DataFrame]:
+    """Reads multiple raw files concurrently instead of one at a time.
+
+    This was the single biggest bottleneck in Bronze: each raw file
+    was fetched with its own sequential network round-trip to HF's S3
+    endpoint, so a backlog of hundreds/thousands of files meant
+    hundreds/thousands of round-trips waited on one after another.
+    boto3 clients are safe to share across threads for read calls like
+    get_object, so this uses a thread pool - this is I/O-bound work
+    (waiting on network), which is exactly what threads (not
+    processes) are good for in Python, since the GIL is released
+    while waiting on I/O.
+    """
+    results: dict[str, pd.DataFrame] = {}
+    errors: dict[str, Exception] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_key = {
+            executor.submit(read_parquet_from_s3, s3, bucket, k): k
+            for k in file_keys
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                errors[key] = e
+
+    if errors:
+        # Surface every failed file, not just the first one - makes
+        # debugging a partial-failure batch much easier than a single
+        # opaque stack trace.
+        for key, e in errors.items():
+            print(f"  ERROR fetching {key}: {e}")
+        raise RuntimeError(f"Failed to fetch {len(errors)}/{len(file_keys)} raw file(s)")
+
+    return results
+
+
 def process_files_into_df(s3, bucket: str, file_keys: list[str], cfg: dict,
                            ingested_at: str, run_id: str):
     """Reads a set of raw files, applies schema validation + audit
     tagging, and stamps building_id/dt from the path. Deliberately no
     dedup here - that's Staging's job now."""
+    print(f"  fetching {len(file_keys)} raw file(s) ({MAX_PARALLEL_FETCHES} at a time)...")
+    fetched = fetch_files_parallel(s3, bucket, file_keys)
+
     groups = group_by_partition(file_keys)
     total_raw_rows = 0
     partition_dfs = []
@@ -209,7 +255,7 @@ def process_files_into_df(s3, bucket: str, file_keys: list[str], cfg: dict,
     for (building_id, dt), keys in sorted(groups.items()):
         dfs = []
         for k in keys:
-            file_df = read_parquet_from_s3(s3, bucket, k)
+            file_df = fetched[k]
             file_df = validate_schema(file_df, cfg["expected_columns"], k)
             file_df = tag_audit_metadata(file_df, k, ingested_at, run_id)
             dfs.append(file_df)

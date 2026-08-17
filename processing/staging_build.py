@@ -34,13 +34,16 @@ Env vars required:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import boto3
 import pandas as pd
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import DeltaError, TableNotFoundError
 
@@ -105,18 +108,63 @@ def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
     return deleted
 
 
+# ------------------------------------------------------------------
+# Watermark manifest - tracks which Bronze _pipeline_run_id values
+# have already been incorporated into Staging, so each run only
+# transforms and writes rows from NEW Bronze runs.
+#
+# Important limitation, stated plainly: deltalake's Python reader has
+# no cheap way to read only "new" rows from a Delta table (that needs
+# Change Data Feed, which isn't set up here) - so this still reads the
+# ENTIRE Bronze table into memory every run. The win is real but
+# partial: only new rows get run through cast/null-handling/dedup, and
+# only new rows get WRITTEN (appended, not a full table rewrite) -
+# which is where the bulk of the time was actually going for a large
+# accumulated history.
+# ------------------------------------------------------------------
+def manifest_key(dataset_name: str) -> str:
+    return f"staging/_manifests/{dataset_name}_processed_run_ids.json"
+
+
+def get_manifest(s3, bucket: str, dataset_name: str) -> set[str]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=manifest_key(dataset_name))
+        data = json.loads(obj["Body"].read())
+        return set(data.get("processed_run_ids", []))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return set()
+        raise
+
+
+def put_manifest(s3, bucket: str, dataset_name: str, processed_run_ids: set[str]) -> None:
+    body = json.dumps({
+        "processed_run_ids": sorted(processed_run_ids),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=manifest_key(dataset_name), Body=body,
+                  ContentType="application/json")
+
+
+def staging_table_exists(table_uri: str, storage_options: dict) -> bool:
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except TableNotFoundError:
+        return False
+
+
 def write_staging_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
-                         storage_options: dict, max_attempts: int = 4) -> None:
-    """Same retry-then-self-heal pattern as Bronze/Silver. Staging is
-    rebuilt fully from Bronze every run (no incremental state of its
-    own), so there's nothing lost by wiping and recreating it if it
-    ever gets into a bad state."""
+                         storage_options: dict, mode: str, max_attempts: int = 4) -> None:
+    """mode is 'append' (normal incremental case) or 'overwrite' (first
+    write, or a self-heal rebuild)."""
     table_uri = f"s3://{bucket}/staging/{dataset_name}"
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             write_deltalake(
-                table_uri, df, mode="overwrite",
+                table_uri, df, mode=mode,
                 partition_by=["building_id", "dt"], storage_options=storage_options,
             )
             return
@@ -208,29 +256,71 @@ def build_staging(s3, dataset_name: str, bucket: str, storage_options: dict) -> 
     print(f"\n=== {dataset_name} ===")
     cfg = DATASETS[dataset_name]
     bronze_uri = f"s3://{bucket}/bronze/{dataset_name}"
+    staging_uri = f"s3://{bucket}/staging/{dataset_name}"
 
     try:
         bronze_table = DeltaTable(bronze_uri, storage_options=storage_options)
     except TableNotFoundError:
         print(f"  no Bronze table found at {bronze_uri}, skipping")
-        return {"rows_in": 0, "rows_out": 0, "duplicates_removed": 0}
+        return {"rows_in": 0, "rows_out": 0, "duplicates_removed": 0, "new_runs": 0}
 
-    df = bronze_table.to_pandas()
+    full_bronze_df = bronze_table.to_pandas()
+    print(f"  read {len(full_bronze_df)} total rows from Bronze (version {bronze_table.version()})")
+
+    processed_run_ids = get_manifest(s3, bucket, dataset_name)
+    all_run_ids = set(full_bronze_df["_pipeline_run_id"].dropna().unique())
+    new_run_ids = all_run_ids - processed_run_ids
+
+    if not new_run_ids:
+        print(f"  watermark: {len(processed_run_ids)} Bronze run(s) already processed, "
+              f"0 new run(s) - nothing to do")
+        return {"rows_in": 0, "rows_out": 0, "duplicates_removed": 0, "new_runs": 0}
+
+    print(f"  watermark: {len(processed_run_ids)} Bronze run(s) already processed, "
+          f"{len(new_run_ids)} new run(s) to incorporate")
+
+    df = full_bronze_df[full_bronze_df["_pipeline_run_id"].isin(new_run_ids)].copy()
     rows_in = len(df)
-    print(f"  read {rows_in} rows from Bronze (version {bronze_table.version()})")
 
     df = cast_types(df, cfg)
     df = handle_nulls(df, dataset_name)
     df = format_strings(df, cfg)
+    # Dedup only within THIS new batch, not against the full Staging
+    # history - acceptable here because Bronze is itself watermarked
+    # per raw file, so the same reading shouldn't arrive as "new"
+    # twice across separate Bronze runs in the first place.
     df, duplicates_removed = deduplicate(df, cfg)
     rows_out = len(df)
 
-    print(f"  {rows_in} rows -> {rows_out} rows ({duplicates_removed} exact duplicate(s) removed)")
+    print(f"  {rows_in} new row(s) -> {rows_out} row(s) "
+          f"({duplicates_removed} exact duplicate(s) removed within this batch)")
 
-    print(f"  writing {rows_out} rows to staging/{dataset_name} in a single commit...")
-    write_staging_table(s3, bucket, dataset_name, df, storage_options)
+    table_exists = staging_table_exists(staging_uri, storage_options)
+    mode = "append" if table_exists else "overwrite"
+    print(f"  writing {rows_out} row(s) to staging/{dataset_name} ({mode})...")
 
-    return {"rows_in": rows_in, "rows_out": rows_out, "duplicates_removed": duplicates_removed}
+    try:
+        write_staging_table(s3, bucket, dataset_name, df, storage_options, mode)
+        processed_run_ids |= new_run_ids
+    except DeltaError as e:
+        print(f"  write failed even after retries+self-heal attempt ({e}). "
+              f"Falling back to a full rebuild from all of Bronze...")
+        delete_prefix_objects(s3, bucket, f"staging/{dataset_name}/")
+        full_df = full_bronze_df.copy()
+        full_df = cast_types(full_df, cfg)
+        full_df = handle_nulls(full_df, dataset_name)
+        full_df = format_strings(full_df, cfg)
+        full_df, _ = deduplicate(full_df, cfg)
+        write_staging_table(s3, bucket, dataset_name, full_df, storage_options, "overwrite")
+        processed_run_ids = all_run_ids
+        rows_out = len(full_df)
+        print(f"  full rebuild succeeded - staging/{dataset_name} recreated fresh "
+              f"from all of Bronze ({rows_out} rows).")
+
+    put_manifest(s3, bucket, dataset_name, processed_run_ids)
+
+    return {"rows_in": rows_in, "rows_out": rows_out, "duplicates_removed": duplicates_removed,
+            "new_runs": len(new_run_ids)}
 
 
 def main():
@@ -247,12 +337,14 @@ def main():
         results[name] = build_staging(s3, name, bucket, storage_options)
 
     print("\n=== Summary ===")
-    total_in = total_out = total_dupes = 0
+    total_in = total_out = total_dupes = total_new_runs = 0
     for name, r in results.items():
-        print(f"{name}: {r['rows_in']} in -> {r['rows_out']} out ({r['duplicates_removed']} duplicates removed)")
+        print(f"{name}: {r['new_runs']} new Bronze run(s), {r['rows_in']} in -> "
+              f"{r['rows_out']} out ({r['duplicates_removed']} duplicates removed)")
         total_in += r["rows_in"]
         total_out += r["rows_out"]
         total_dupes += r["duplicates_removed"]
+        total_new_runs += r["new_runs"]
 
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
@@ -260,6 +352,7 @@ def main():
             f.write(f"total_rows_in={total_in}\n")
             f.write(f"total_rows_out={total_out}\n")
             f.write(f"total_duplicates_removed={total_dupes}\n")
+            f.write(f"total_new_runs={total_new_runs}\n")
 
 
 if __name__ == "__main__":
