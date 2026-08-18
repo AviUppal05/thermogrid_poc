@@ -42,6 +42,7 @@ Env vars required:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -50,6 +51,7 @@ from datetime import datetime, timezone
 import boto3
 import pandas as pd
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import DeltaError, TableNotFoundError
 
@@ -102,17 +104,20 @@ def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
 
 
 def write_snapshot_table(s3, bucket: str, prefix: str, dataset_name: str, df: pd.DataFrame,
-                          storage_options: dict, max_attempts: int = 4) -> None:
-    """For tables that represent a full CURRENT-STATE snapshot each run
-    (dq_validated, quarantine) - overwrite + retry + self-heal, same
-    pattern used for Bronze/Staging. Safe to wipe-and-recreate on
-    failure since the whole table is rebuilt fresh every run anyway."""
+                          storage_options: dict, mode: str, max_attempts: int = 4) -> None:
+    """mode is 'append' (normal incremental case) or 'overwrite' (first
+    write). Retries only - does NOT self-heal internally. df here is
+    only the NEW batch, not the full table, so wiping-and-rewriting
+    just this df would destroy all previously accumulated history.
+    The caller (which has access to the full upstream data) is
+    responsible for the full-reprocess fallback on failure - see
+    run_dq_validation."""
     table_uri = f"s3://{bucket}/{prefix}/{dataset_name}"
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             write_deltalake(
-                table_uri, df, mode="overwrite",
+                table_uri, df, mode=mode,
                 partition_by=["building_id", "dt"], storage_options=storage_options,
             )
             return
@@ -123,16 +128,45 @@ def write_snapshot_table(s3, bucket: str, prefix: str, dataset_name: str, df: pd
                 print(f"  write attempt {attempt}/{max_attempts} failed "
                       f"({e}), retrying in {wait}s...")
                 time.sleep(wait)
+    raise last_error
 
-    print(f"  all {max_attempts} write attempts failed ({last_error}). "
-          f"Self-healing: wiping {prefix}/{dataset_name} and recreating fresh...")
-    deleted = delete_prefix_objects(s3, bucket, f"{prefix}/{dataset_name}/")
-    print(f"  deleted {deleted} object(s), retrying write once more...")
-    write_deltalake(
-        table_uri, df, mode="overwrite",
-        partition_by=["building_id", "dt"], storage_options=storage_options,
-    )
-    print(f"  self-heal succeeded - {prefix}/{dataset_name} recreated cleanly.")
+
+
+def table_exists(table_uri: str, storage_options: dict) -> bool:
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except TableNotFoundError:
+        return False
+
+
+# ------------------------------------------------------------------
+# Watermark manifest - tracks which Staging _pipeline_run_id values
+# have already been processed by DQ Validation.
+# ------------------------------------------------------------------
+def manifest_key(dataset_name: str) -> str:
+    return f"dq_validated/_manifests/{dataset_name}_processed_run_ids.json"
+
+
+def get_manifest(s3, bucket: str, dataset_name: str) -> set[str]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=manifest_key(dataset_name))
+        data = json.loads(obj["Body"].read())
+        return set(data.get("processed_run_ids", []))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return set()
+        raise
+
+
+def put_manifest(s3, bucket: str, dataset_name: str, processed_run_ids: set[str]) -> None:
+    body = json.dumps({
+        "processed_run_ids": sorted(processed_run_ids),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=manifest_key(dataset_name), Body=body,
+                  ContentType="application/json")
 
 
 def append_log_row(s3, bucket: str, dataset_name: str, log_row: dict,
@@ -256,6 +290,7 @@ def utility_quality_checks(df: pd.DataFrame) -> list[tuple]:
 def run_dq_validation(s3, dataset_name: str, bucket: str, storage_options: dict, run_id: str) -> dict:
     print(f"\n=== {dataset_name} ===")
     staging_uri = f"s3://{bucket}/staging/{dataset_name}"
+    dq_validated_uri = f"s3://{bucket}/dq_validated/{dataset_name}"
 
     try:
         staging_table = DeltaTable(staging_uri, storage_options=storage_options)
@@ -263,9 +298,23 @@ def run_dq_validation(s3, dataset_name: str, bucket: str, storage_options: dict,
         print(f"  no Staging table found at {staging_uri}, skipping")
         return {"rows": 0, "clean": 0, "warning": 0, "critical": 0, "duplicates_found": 0}
 
-    df = staging_table.to_pandas()
+    full_staging_df = staging_table.to_pandas()
+    print(f"  read {len(full_staging_df)} total rows from Staging (version {staging_table.version()})")
+
+    processed_run_ids = get_manifest(s3, bucket, dataset_name)
+    all_run_ids = set(full_staging_df["_pipeline_run_id"].dropna().unique())
+    new_run_ids = all_run_ids - processed_run_ids
+
+    if not new_run_ids:
+        print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+              f"0 new run(s) - nothing to do")
+        return {"rows": 0, "clean": 0, "warning": 0, "critical": 0, "duplicates_found": 0}
+
+    print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+          f"{len(new_run_ids)} new run(s) to validate")
+
+    df = full_staging_df[full_staging_df["_pipeline_run_id"].isin(new_run_ids)].copy()
     total_rows = len(df)
-    print(f"  read {total_rows} rows from Staging (version {staging_table.version()})")
 
     duplicates_found = validate_no_duplicates(df, DATASETS[dataset_name]["dedup_keys"])
 
@@ -276,16 +325,49 @@ def run_dq_validation(s3, dataset_name: str, bucket: str, storage_options: dict,
     clean = counts.get("clean", 0)
     warning = counts.get("warning", 0)
     critical = counts.get("critical", 0)
-    print(f"  quality summary: {clean} clean, {warning} warning, {critical} critical "
-          f"(all {total_rows} rows kept in dq_validated)")
+    print(f"  quality summary (this batch): {clean} clean, {warning} warning, {critical} critical "
+          f"({total_rows} new rows, all kept in dq_validated)")
 
-    print(f"  writing {total_rows} rows to dq_validated/{dataset_name}...")
-    write_snapshot_table(s3, bucket, "dq_validated", dataset_name, df, storage_options)
+    mode = "append" if table_exists(dq_validated_uri, storage_options) else "overwrite"
+    print(f"  writing {total_rows} row(s) to dq_validated/{dataset_name} ({mode})...")
 
-    quarantine_df = df[df["data_quality_flag"] == "critical"].reset_index(drop=True)
-    print(f"  writing {len(quarantine_df)} row(s) to quarantine/{dataset_name} "
-          f"(copy of critical rows - not removed from dq_validated)...")
-    write_snapshot_table(s3, bucket, "quarantine", dataset_name, quarantine_df, storage_options)
+    try:
+        write_snapshot_table(s3, bucket, "dq_validated", dataset_name, df, storage_options, mode)
+        quarantine_df = df[df["data_quality_flag"] == "critical"].reset_index(drop=True)
+        quarantine_uri = f"s3://{bucket}/quarantine/{dataset_name}"
+        if len(quarantine_df) > 0:
+            q_mode = "append" if table_exists(quarantine_uri, storage_options) else "overwrite"
+            print(f"  writing {len(quarantine_df)} row(s) to quarantine/{dataset_name} ({q_mode})...")
+            write_snapshot_table(s3, bucket, "quarantine", dataset_name, quarantine_df, storage_options, q_mode)
+        else:
+            print(f"  no critical rows in this batch, nothing to add to quarantine/{dataset_name}")
+        final_processed_run_ids = processed_run_ids | new_run_ids
+    except DeltaError as e:
+        print(f"  write failed even after retries ({e}). Falling back to a full "
+              f"rebuild of dq_validated/{dataset_name} and quarantine/{dataset_name} "
+              f"from all of Staging...")
+        delete_prefix_objects(s3, bucket, f"dq_validated/{dataset_name}/")
+        delete_prefix_objects(s3, bucket, f"quarantine/{dataset_name}/")
+
+        full_df = full_staging_df.copy()
+        validate_no_duplicates(full_df, DATASETS[dataset_name]["dedup_keys"])
+        checks = hvac_quality_checks(full_df) if dataset_name == "hvac_telemetry" else utility_quality_checks(full_df)
+        full_df = apply_quality_checks(full_df, checks)
+
+        write_snapshot_table(s3, bucket, "dq_validated", dataset_name, full_df, storage_options, "overwrite")
+        full_quarantine_df = full_df[full_df["data_quality_flag"] == "critical"].reset_index(drop=True)
+        if len(full_quarantine_df) > 0:
+            write_snapshot_table(s3, bucket, "quarantine", dataset_name, full_quarantine_df,
+                                  storage_options, "overwrite")
+
+        final_processed_run_ids = all_run_ids
+        counts = full_df["data_quality_flag"].value_counts().to_dict()
+        clean, warning, critical = counts.get("clean", 0), counts.get("warning", 0), counts.get("critical", 0)
+        total_rows = len(full_df)
+        print(f"  full rebuild succeeded - dq_validated/{dataset_name} recreated fresh "
+              f"from all of Staging ({total_rows} rows).")
+
+    put_manifest(s3, bucket, dataset_name, final_processed_run_ids)
 
     log_row = {
         "run_id": run_id,

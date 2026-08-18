@@ -40,14 +40,17 @@ Env vars required:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import boto3
 import pandas as pd
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import DeltaError, TableNotFoundError
 
@@ -94,14 +97,50 @@ def delete_prefix_objects(s3, bucket: str, prefix: str) -> int:
     return deleted
 
 
+def table_exists(table_uri: str, storage_options: dict) -> bool:
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except TableNotFoundError:
+        return False
+
+
+def manifest_key(dataset_name: str) -> str:
+    return f"silver/_manifests/{dataset_name}_processed_run_ids.json"
+
+
+def get_manifest(s3, bucket: str, dataset_name: str) -> set[str]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=manifest_key(dataset_name))
+        data = json.loads(obj["Body"].read())
+        return set(data.get("processed_run_ids", []))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return set()
+        raise
+
+
+def put_manifest(s3, bucket: str, dataset_name: str, processed_run_ids: set[str]) -> None:
+    body = json.dumps({
+        "processed_run_ids": sorted(processed_run_ids),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=manifest_key(dataset_name), Body=body,
+                  ContentType="application/json")
+
+
 def write_silver_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
-                        storage_options: dict, max_attempts: int = 4) -> None:
+                        storage_options: dict, mode: str, max_attempts: int = 4) -> None:
+    """Retries only - no internal self-heal. df here is only the new
+    batch; see build_silver_hvac/build_silver_utility for the
+    full-reprocess fallback."""
     table_uri = f"s3://{bucket}/silver/{dataset_name}"
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             write_deltalake(
-                table_uri, df, mode="overwrite",
+                table_uri, df, mode=mode,
                 partition_by=["building_id", "dt"], storage_options=storage_options,
             )
             return
@@ -112,16 +151,8 @@ def write_silver_table(s3, bucket: str, dataset_name: str, df: pd.DataFrame,
                 print(f"  write attempt {attempt}/{max_attempts} failed "
                       f"({e}), retrying in {wait}s...")
                 time.sleep(wait)
+    raise last_error
 
-    print(f"  all {max_attempts} write attempts failed ({last_error}). "
-          f"Self-healing: wiping silver/{dataset_name} and recreating fresh...")
-    deleted = delete_prefix_objects(s3, bucket, f"silver/{dataset_name}/")
-    print(f"  deleted {deleted} object(s), retrying write once more...")
-    write_deltalake(
-        table_uri, df, mode="overwrite",
-        partition_by=["building_id", "dt"], storage_options=storage_options,
-    )
-    print(f"  self-heal succeeded - silver/{dataset_name} recreated cleanly.")
 
 
 # ------------------------------------------------------------------
@@ -198,44 +229,112 @@ def enrich_utility(df: pd.DataFrame) -> pd.DataFrame:
 def build_silver_hvac(s3, bucket: str, storage_options: dict) -> dict:
     print("\n=== hvac_telemetry (Silver enrichment) ===")
     source_uri = f"s3://{bucket}/fault_detection/hvac_telemetry"
+    silver_uri = f"s3://{bucket}/silver/hvac_telemetry"
     try:
         table = DeltaTable(source_uri, storage_options=storage_options)
     except TableNotFoundError:
         print(f"  no fault_detection table found at {source_uri}, skipping")
         return {"rows": 0, "enriched": 0}
 
-    df = table.to_pandas()
+    full_df = table.to_pandas()
+    print(f"  read {len(full_df)} total rows from fault_detection (version {table.version()})")
+
+    processed_run_ids = get_manifest(s3, bucket, "hvac_telemetry")
+    all_run_ids = set(full_df["_pipeline_run_id"].dropna().unique())
+    new_run_ids = all_run_ids - processed_run_ids
+
+    if not new_run_ids:
+        print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+              f"0 new run(s) - nothing to do")
+        return {"rows": 0, "enriched": 0}
+
+    print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+          f"{len(new_run_ids)} new run(s) to enrich")
+
+    df = full_df[full_df["_pipeline_run_id"].isin(new_run_ids)].copy()
     total_rows = len(df)
-    print(f"  read {total_rows} rows from fault_detection (version {table.version()})")
 
     df = enrich_hvac(df)
     enriched = int((df["data_quality_flag"] != "critical").sum())
     print(f"  computed KPIs for {enriched}/{total_rows} rows "
           f"({total_rows - enriched} critical row(s) kept with null KPIs)")
 
-    write_silver_table(s3, bucket, "hvac_telemetry", df, storage_options)
+    mode = "append" if table_exists(silver_uri, storage_options) else "overwrite"
+    print(f"  writing {total_rows} row(s) to silver/hvac_telemetry ({mode})...")
+
+    try:
+        write_silver_table(s3, bucket, "hvac_telemetry", df, storage_options, mode)
+        final_processed_run_ids = processed_run_ids | new_run_ids
+    except DeltaError as e:
+        print(f"  write failed even after retries ({e}). Falling back to a full "
+              f"rebuild of silver/hvac_telemetry from all of fault_detection...")
+        delete_prefix_objects(s3, bucket, "silver/hvac_telemetry/")
+        full_reprocess_df = enrich_hvac(full_df.copy())
+        write_silver_table(s3, bucket, "hvac_telemetry", full_reprocess_df, storage_options, "overwrite")
+        final_processed_run_ids = all_run_ids
+        total_rows = len(full_reprocess_df)
+        enriched = int((full_reprocess_df["data_quality_flag"] != "critical").sum())
+        print(f"  full rebuild succeeded - silver/hvac_telemetry recreated fresh "
+              f"from all of fault_detection ({total_rows} rows).")
+
+    put_manifest(s3, bucket, "hvac_telemetry", final_processed_run_ids)
+
     return {"rows": total_rows, "enriched": enriched}
 
 
 def build_silver_utility(s3, bucket: str, storage_options: dict) -> dict:
     print("\n=== utility_meter (Silver enrichment) ===")
     source_uri = f"s3://{bucket}/dq_validated/utility_meter"
+    silver_uri = f"s3://{bucket}/silver/utility_meter"
     try:
         table = DeltaTable(source_uri, storage_options=storage_options)
     except TableNotFoundError:
         print(f"  no dq_validated table found at {source_uri}, skipping")
         return {"rows": 0, "enriched": 0}
 
-    df = table.to_pandas()
+    full_df = table.to_pandas()
+    print(f"  read {len(full_df)} total rows from dq_validated (version {table.version()})")
+
+    processed_run_ids = get_manifest(s3, bucket, "utility_meter")
+    all_run_ids = set(full_df["_pipeline_run_id"].dropna().unique())
+    new_run_ids = all_run_ids - processed_run_ids
+
+    if not new_run_ids:
+        print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+              f"0 new run(s) - nothing to do")
+        return {"rows": 0, "enriched": 0}
+
+    print(f"  watermark: {len(processed_run_ids)} run(s) already processed, "
+          f"{len(new_run_ids)} new run(s) to enrich")
+
+    df = full_df[full_df["_pipeline_run_id"].isin(new_run_ids)].copy()
     total_rows = len(df)
-    print(f"  read {total_rows} rows from dq_validated (version {table.version()})")
 
     df = enrich_utility(df)
     enriched = int((df["data_quality_flag"] != "critical").sum())
     print(f"  computed KPIs for {enriched}/{total_rows} rows "
           f"({total_rows - enriched} critical row(s) kept with null KPIs)")
 
-    write_silver_table(s3, bucket, "utility_meter", df, storage_options)
+    mode = "append" if table_exists(silver_uri, storage_options) else "overwrite"
+    print(f"  writing {total_rows} row(s) to silver/utility_meter ({mode})...")
+
+    try:
+        write_silver_table(s3, bucket, "utility_meter", df, storage_options, mode)
+        final_processed_run_ids = processed_run_ids | new_run_ids
+    except DeltaError as e:
+        print(f"  write failed even after retries ({e}). Falling back to a full "
+              f"rebuild of silver/utility_meter from all of dq_validated...")
+        delete_prefix_objects(s3, bucket, "silver/utility_meter/")
+        full_reprocess_df = enrich_utility(full_df.copy())
+        write_silver_table(s3, bucket, "utility_meter", full_reprocess_df, storage_options, "overwrite")
+        final_processed_run_ids = all_run_ids
+        total_rows = len(full_reprocess_df)
+        enriched = int((full_reprocess_df["data_quality_flag"] != "critical").sum())
+        print(f"  full rebuild succeeded - silver/utility_meter recreated fresh "
+              f"from all of dq_validated ({total_rows} rows).")
+
+    put_manifest(s3, bucket, "utility_meter", final_processed_run_ids)
+
     return {"rows": total_rows, "enriched": enriched}
 
 
