@@ -95,7 +95,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "## 📊 Sensor Data Generation Report" >> $GITHUB_STEP_SUMMARY
+          echo "##Sensor Data Generation Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY

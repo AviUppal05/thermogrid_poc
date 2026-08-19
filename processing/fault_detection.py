@@ -222,11 +222,19 @@ def run_fault_detection(s3, bucket: str, storage_options: dict) -> dict:
     df = full_df[full_df["_pipeline_run_id"].isin(new_run_ids)].copy()
     total_rows = len(df)
 
-    df["overheating_flag"] = detect_overheating(df)
-    df["coolant_leak_flag"] = detect_coolant_leak(df)
-    # re-surfacing the generator's own signal explicitly in this table,
-    # not redefining it - status_flag == 'Fault' already means "the
-    # equipment reported a fault"
+    # Exclude critical (corrupted-reading) rows from anomaly detection,
+    # same principle as Silver's KPI computation: a glitched 400F
+    # supply_air_temp reading isn't evidence of real overheating, it's
+    # sensor/transmission noise - counting it as an alarm would be
+    # exactly the "garbage in, garbage out" mistake this pipeline has
+    # been careful to avoid everywhere else. Null (not False) for
+    # critical rows - "unknown, data corrupted" is honest;
+    # "confirmed not overheating" would not be.
+    computable = df["data_quality_flag"] != "critical"
+    df["overheating_flag"] = detect_overheating(df).where(computable)
+    df["coolant_leak_flag"] = detect_coolant_leak(df).where(computable)
+    # status_flag isn't touched by any glitch type, so it's trustworthy
+    # regardless of data_quality_flag - no need to null this one.
     df["operational_fault_flag"] = df["status_flag"].str.lower() == "fault"
 
     overheating_count = int(df["overheating_flag"].sum())
@@ -248,8 +256,9 @@ def run_fault_detection(s3, bucket: str, storage_options: dict) -> dict:
         delete_prefix_objects(s3, bucket, "fault_detection/hvac_telemetry/")
 
         full_reprocess_df = full_df.copy()
-        full_reprocess_df["overheating_flag"] = detect_overheating(full_reprocess_df)
-        full_reprocess_df["coolant_leak_flag"] = detect_coolant_leak(full_reprocess_df)
+        full_computable = full_reprocess_df["data_quality_flag"] != "critical"
+        full_reprocess_df["overheating_flag"] = detect_overheating(full_reprocess_df).where(full_computable)
+        full_reprocess_df["coolant_leak_flag"] = detect_coolant_leak(full_reprocess_df).where(full_computable)
         full_reprocess_df["operational_fault_flag"] = full_reprocess_df["status_flag"].str.lower() == "fault"
 
         write_fault_table(s3, bucket, full_reprocess_df, storage_options, "overwrite")
