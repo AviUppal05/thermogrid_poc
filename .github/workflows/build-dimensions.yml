@@ -1,0 +1,55 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Dimension Tables
+# ============================================================
+# Stage 11 support: builds dim_building, dim_equipment, dim_meter,
+# dim_date, dim_alarm_type for the Power BI star schema.
+#
+# These are small, mostly-static tables (equipment/meter counts come
+# from the generator config, not live data) - manual trigger only,
+# no need for this to run on a schedule. Re-run it if the generator's
+# building/equipment/meter config ever changes.
+# ============================================================
+
+name: Build Dimensions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-dimensions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      PYTHONUNBUFFERED:     "1"
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - name: Build Dimensions
+        id: dims
+        run: python build_dimensions.py
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📐 Dimension Tables Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Table | Rows |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| dim_building | ${{ steps.dims.outputs.dim_building_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| dim_equipment | ${{ steps.dims.outputs.dim_equipment_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| dim_meter | ${{ steps.dims.outputs.dim_meter_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| dim_alarm_type | ${{ steps.dims.outputs.dim_alarm_type_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| dim_date | ${{ steps.dims.outputs.dim_date_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY

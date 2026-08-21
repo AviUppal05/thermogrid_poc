@@ -1,0 +1,59 @@
+# ============================================================
+# GitHub Actions: ThermoGrid Equipment-Level Fact Table
+# ============================================================
+# Stage 11 support: gold/fact_equipment_daily, one row per AHU per
+# day, for equipment-level maintenance reporting in Power BI.
+#
+# Triggered after "Fault Detection" since that's its data source -
+# runs alongside (not instead of) the existing Build Gold workflow.
+# ============================================================
+
+name: Build Fact Equipment Daily
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Fault Detection"]
+    types: [completed]
+
+concurrency:
+  group: build-fact-equipment-daily
+  cancel-in-progress: false
+
+jobs:
+  build-fact-equipment-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      PYTHONUNBUFFERED:     "1"
+      HF_ACCESS_KEY_ID:     ${{ secrets.HF_ACCESS_KEY_ID }}
+      HF_SECRET_ACCESS_KEY: ${{ secrets.HF_SECRET_ACCESS_KEY }}
+      HF_NAMESPACE:         ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET_NAME:       ${{ secrets.HF_BUCKET_NAME }}
+
+    defaults:
+      run:
+        working-directory: ./processing
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - name: Build fact_equipment_daily
+        id: fact
+        run: python build_fact_equipment_daily.py
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🔧 Equipment Daily Fact Table Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Equipment/Day Rows | ${{ steps.fact.outputs.fact_equipment_daily_rows || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
